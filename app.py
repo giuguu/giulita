@@ -563,6 +563,37 @@ st.markdown(
         z-index: 1;
     }}
 
+    /* Encabezado visual para cada sección principal */
+    .page-hero {{
+        min-height: 245px;
+        margin-bottom: 1.5rem;
+    }}
+
+    .page-hero .hero-content {{
+        min-height: 245px;
+        padding: 32px 38px;
+    }}
+
+    .page-hero .hero-title {{
+        font-size: clamp(2rem, 4vw, 3.35rem);
+    }}
+
+    .page-hero .hero-text {{
+        max-width: 760px;
+        margin-top: 9px;
+    }}
+
+    @media (max-width: 768px) {{
+        .page-hero {{
+            min-height: 220px;
+            border-radius: 22px;
+        }}
+        .page-hero .hero-content {{
+            min-height: 220px;
+            padding: 24px 22px;
+        }}
+    }}
+
     .hero-no-image {{
         background: linear-gradient(135deg, #d9468d 0%, #b83272 55%, #8f285d 100%);
     }}
@@ -764,6 +795,15 @@ def init_db():
     # Reservas antiguas
     add_column_if_missing("reservations", "department_id", "INTEGER NOT NULL DEFAULT 1")
     add_column_if_missing("reservations", "guest", "TEXT NOT NULL DEFAULT ''")
+    # Compatibilidad con una versión que utilizaba "guest_name".
+    # No eliminamos esa columna para conservar la base de datos existente.
+    add_column_if_missing("reservations", "guest_name", "TEXT NOT NULL DEFAULT ''")
+    cur.execute("""
+        UPDATE reservations
+        SET guest_name = guest
+        WHERE (guest_name IS NULL OR TRIM(guest_name) = '')
+          AND guest IS NOT NULL
+    """)
     add_column_if_missing("reservations", "phone", "TEXT DEFAULT ''")
     add_column_if_missing("reservations", "check_in", "TEXT NOT NULL DEFAULT '2000-01-01'")
     add_column_if_missing("reservations", "check_in_time", "TEXT DEFAULT '15:00'")
@@ -997,34 +1037,68 @@ def save_reservation(
     conn = db()
     cur = conn.cursor()
 
+    reservation_columns = {
+        row[1] for row in cur.execute("PRAGMA table_info(reservations)").fetchall()
+    }
+
     if reservation_id:
-        cur.execute("""
-            UPDATE reservations
-            SET department_id=?, guest=?, phone=?, check_in=?,
-                check_in_time=?, check_out=?, check_out_time=?,
-                guests=?, price_night=?, nights=?, total=?,
-                deposit_percent=?, deposited=?, status=?
-            WHERE id=?
-        """, (
-            department_id, guest, phone, check_in.isoformat(),
-            check_in_time, check_out.isoformat(), check_out_time,
-            guests, price_night, nights, total,
-            deposit_percent, deposited, status, reservation_id
-        ))
+        # Mantiene compatibilidad con bases antiguas que tienen guest_name.
+        if "guest_name" in reservation_columns:
+            cur.execute("""
+                UPDATE reservations
+                SET department_id=?, guest=?, guest_name=?, phone=?, check_in=?,
+                    check_in_time=?, check_out=?, check_out_time=?,
+                    guests=?, price_night=?, nights=?, total=?,
+                    deposit_percent=?, deposited=?, status=?
+                WHERE id=?
+            """, (
+                department_id, guest, guest, phone, check_in.isoformat(),
+                check_in_time, check_out.isoformat(), check_out_time,
+                guests, price_night, nights, total,
+                deposit_percent, deposited, status, reservation_id
+            ))
+        else:
+            cur.execute("""
+                UPDATE reservations
+                SET department_id=?, guest=?, phone=?, check_in=?,
+                    check_in_time=?, check_out=?, check_out_time=?,
+                    guests=?, price_night=?, nights=?, total=?,
+                    deposit_percent=?, deposited=?, status=?
+                WHERE id=?
+            """, (
+                department_id, guest, phone, check_in.isoformat(),
+                check_in_time, check_out.isoformat(), check_out_time,
+                guests, price_night, nights, total,
+                deposit_percent, deposited, status, reservation_id
+            ))
         rid = reservation_id
     else:
-        cur.execute("""
-            INSERT INTO reservations
-            (department_id, guest, phone, check_in, check_in_time,
-             check_out, check_out_time, guests, price_night, nights,
-             total, deposit_percent, deposited, status)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-        """, (
-            department_id, guest, phone, check_in.isoformat(),
-            check_in_time, check_out.isoformat(), check_out_time,
-            guests, price_night, nights, total,
-            deposit_percent, deposited, status
-        ))
+        if "guest_name" in reservation_columns:
+            cur.execute("""
+                INSERT INTO reservations
+                (department_id, guest, guest_name, phone, check_in, check_in_time,
+                 check_out, check_out_time, guests, price_night, nights,
+                 total, deposit_percent, deposited, status)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """, (
+                department_id, guest, guest, phone, check_in.isoformat(),
+                check_in_time, check_out.isoformat(), check_out_time,
+                guests, price_night, nights, total,
+                deposit_percent, deposited, status
+            ))
+        else:
+            cur.execute("""
+                INSERT INTO reservations
+                (department_id, guest, phone, check_in, check_in_time,
+                 check_out, check_out_time, guests, price_night, nights,
+                 total, deposit_percent, deposited, status)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """, (
+                department_id, guest, phone, check_in.isoformat(),
+                check_in_time, check_out.isoformat(), check_out_time,
+                guests, price_night, nights, total,
+                deposit_percent, deposited, status
+            ))
         rid = cur.lastrowid
 
         cur.execute("""
@@ -1284,6 +1358,36 @@ def fecha_corta_espanol(fecha):
     return f"{fecha.day} {_MESES[fecha.month - 1][:3]}"
 
 
+def page_section_header(title, subtitle, kicker="Gestión de arriendos temporales"):
+    """Muestra la misma portada de Inicio, usando portada.jpg como imagen real."""
+    image_uri = _portada_data_uri()
+
+    if image_uri:
+        hero_html = f"""
+        <section class="hero page-hero">
+            <img class="hero-image" src="{image_uri}" alt="Portada de la aplicación">
+            <div class="hero-overlay"></div>
+            <div class="hero-content">
+                <div class="hero-kicker">{kicker}</div>
+                <h1 class="hero-title">{title}</h1>
+                <div class="hero-text">{subtitle}</div>
+            </div>
+        </section>
+        """
+    else:
+        hero_html = f"""
+        <section class="hero page-hero hero-no-image">
+            <div class="hero-content">
+                <div class="hero-kicker">{kicker}</div>
+                <h1 class="hero-title">{title}</h1>
+                <div class="hero-text">{subtitle}</div>
+            </div>
+        </section>
+        """
+
+    st.markdown(hero_html, unsafe_allow_html=True)
+
+
 def page_inicio():
     reservations = get_reservations()
     today = date.today()
@@ -1450,10 +1554,9 @@ def page_inicio():
 # =========================================================
 
 def page_reservas():
-    st.markdown('<div class="main-title">Reservas</div>', unsafe_allow_html=True)
-    st.markdown(
-        '<div class="subtitle">Crea, consulta y administra las reservas.</div>',
-        unsafe_allow_html=True
+    page_section_header(
+        "Reservas",
+        "Crea, revisa y administra tus reservas de forma simple y ordenada."
     )
 
     tab_new, tab_list = st.tabs(["＋ Nueva reserva", "Reservas registradas"])
@@ -1479,101 +1582,263 @@ def page_reservas():
         c1, c2 = st.columns(2)
 
         with c1:
-            guest = st.text_input("Nombre del huésped")
-            phone = st.text_input("Teléfono / contacto")
+            guest = st.text_input("Nombre del huésped", key="new_guest")
+            phone = st.text_input("Teléfono / contacto", key="new_phone")
             check_in = st.date_input(
                 "Entrada",
                 value=date.today(),
                 key="new_checkin"
             )
-            check_in_time = st.time_input("Hora de check-in", value=datetime.strptime("15:00", "%H:%M").time())
+            check_in_time = st.time_input(
+                "Hora de check-in",
+                value=datetime.strptime("15:00", "%H:%M").time(),
+                key="new_checkin_time"
+            )
 
         with c2:
             guests = st.number_input(
                 "Cantidad de huéspedes",
                 min_value=1,
                 max_value=int(selected_dept["capacity"]),
-                value=1
+                value=1,
+                key="new_guests"
             )
             check_out = st.date_input(
                 "Salida",
                 value=date.today() + timedelta(days=1),
                 key="new_checkout"
             )
-            check_out_time = st.time_input("Hora de check-out", value=datetime.strptime("11:00", "%H:%M").time())
+            check_out_time = st.time_input(
+                "Hora de check-out",
+                value=datetime.strptime("11:00", "%H:%M").time(),
+                key="new_checkout_time"
+            )
 
         price = st.number_input(
             "Precio por noche",
             min_value=0,
             value=int(selected_dept["summer_price"]),
-            step=5000
+            step=5000,
+            key="new_price"
         )
 
         deposit_percent = st.slider(
             "Porcentaje de abono",
             min_value=0,
             max_value=100,
-            value=30
+            value=30,
+            key="new_deposit_percent"
         )
 
-        if check_out > check_in:
+        valid_dates = check_out > check_in
+
+        if valid_dates:
             nights = (check_out - check_in).days
             total = nights * price
             deposit = round(total * deposit_percent / 100)
             balance = total - deposit
-
-            a, b, c = st.columns(3)
-            a.metric("Noches", nights)
-            b.metric("Total", money(total))
-            c.metric("Saldo inicial", money(balance))
         else:
-            st.error("El check-out debe ser posterior al check-in.")
             nights = 0
+            total = 0
+            deposit = 0
+            balance = 0
+            st.error("El check-out debe ser posterior al check-in.")
 
-        conflict = None
-        if check_out > check_in:
-            conflict = conflict_exists(
-                selected_dept["id"],
-                check_in,
-                check_out
-            )
+        # Los cálculos se muestran mientras completas la reserva,
+        # pero NO se comprueba disponibilidad todavía.
+        st.markdown(
+            f"""
+            <div class="payment-summary">
+                <div class="payment-card">
+                    <div class="payment-card-label">NOCHES</div>
+                    <div class="payment-card-value">{nights}</div>
+                </div>
+                <div class="payment-card">
+                    <div class="payment-card-label">TOTAL</div>
+                    <div class="payment-card-value">{money(total)}</div>
+                </div>
+                <div class="payment-card">
+                    <div class="payment-card-label">ABONO</div>
+                    <div class="payment-card-value">{money(deposit)}</div>
+                </div>
+                <div class="payment-card">
+                    <div class="payment-card-label">SALDO INICIAL</div>
+                    <div class="payment-card-value">{money(balance)}</div>
+                </div>
+            </div>
+            """,
+            unsafe_allow_html=True
+        )
 
-        if conflict:
-            st.error(
-                f"❌ No disponible. Existe una reserva de "
-                f"{conflict['guest']} desde {conflict['check_in']} "
-                f"hasta {conflict['check_out']}."
-            )
-        else:
-            st.success("🟢 Las fechas están disponibles.")
+        current_snapshot = (
+            selected_dept["id"],
+            guest.strip(),
+            phone.strip(),
+            check_in.isoformat(),
+            check_in_time.strftime("%H:%M"),
+            check_out.isoformat(),
+            check_out_time.strftime("%H:%M"),
+            int(guests),
+            int(price),
+            int(deposit_percent),
+        )
+
+        reviewed = st.session_state.get("reservation_review")
+        reviewed_snapshot = (
+            reviewed.get("snapshot")
+            if isinstance(reviewed, dict)
+            else None
+        )
+
+        # Si el usuario cambia cualquier dato después de revisar,
+        # se exige volver a revisar antes de guardar.
+        if reviewed_snapshot is not None and reviewed_snapshot != current_snapshot:
+            st.session_state.reservation_review = None
+            reviewed = None
+            reviewed_snapshot = None
+            st.info("Cambiaste un dato de la reserva. Presiona nuevamente «Revisar reserva» para actualizar la revisión.")
 
         if st.button(
-            "Guardar reserva",
+            "👁️ Revisar reserva",
             type="primary",
             use_container_width=True,
-            disabled=bool(conflict) or nights <= 0
+            key="review_reservation"
         ):
             if not guest.strip():
-                st.warning("Ingresa el nombre del huésped.")
+                st.warning("Ingresa el nombre del huésped antes de revisar.")
+                st.session_state.reservation_review = None
+            elif not valid_dates:
+                st.error("Corrige las fechas antes de revisar.")
+                st.session_state.reservation_review = None
             else:
-                rid = save_reservation(
-                    selected_dept["id"],
-                    guest.strip(),
-                    phone.strip(),
-                    check_in,
-                    check_in_time.strftime("%H:%M"),
-                    check_out,
-                    check_out_time.strftime("%H:%M"),
-                    guests,
-                    price,
-                    deposit_percent,
-                    "Pagado completamente" if deposit_percent == 100 else (
-                        "Sin abono" if deposit_percent == 0 else "Abono recibido"
-                    )
-                )
-                st.session_state.selected_reservation = rid
-                st.success("Reserva guardada correctamente.")
+                st.session_state.reservation_review = {
+                    "snapshot": current_snapshot,
+                    "department_id": selected_dept["id"],
+                    "condo": selected_dept["condo"],
+                    "dept_name": selected_dept["name"],
+                    "guest": guest.strip(),
+                    "phone": phone.strip(),
+                    "check_in": check_in,
+                    "check_in_time": check_in_time,
+                    "check_out": check_out,
+                    "check_out_time": check_out_time,
+                    "guests": int(guests),
+                    "price": int(price),
+                    "deposit_percent": int(deposit_percent),
+                    "nights": nights,
+                    "total": total,
+                    "deposit": deposit,
+                    "balance": balance,
+                }
                 st.rerun()
+
+        reviewed = st.session_state.get("reservation_review")
+
+        if isinstance(reviewed, dict):
+            st.markdown(
+                '<div class="section-title">Revisión de la reserva</div>',
+                unsafe_allow_html=True
+            )
+
+            st.markdown(
+                f"""
+                <div class="detail-box">
+                    <div class="detail-label">HUÉSPED</div>
+                    <div class="detail-value">{reviewed["guest"]}</div><br>
+                    <div class="detail-label">CONTACTO</div>
+                    <div class="detail-value">{reviewed["phone"] or "No registrado"}</div><br>
+                    <div class="detail-label">DEPARTAMENTO</div>
+                    <div class="detail-value">🏢 {reviewed["condo"]} · {reviewed["dept_name"]}</div><br>
+                    <div class="detail-label">ESTADÍA</div>
+                    <div class="detail-value">
+                        {reviewed["check_in"].strftime("%d/%m/%Y")} · {reviewed["check_in_time"].strftime("%H:%M")}
+                        → {reviewed["check_out"].strftime("%d/%m/%Y")} · {reviewed["check_out_time"].strftime("%H:%M")}
+                    </div><br>
+                    <div class="detail-label">HUÉSPEDES</div>
+                    <div class="detail-value">{reviewed["guests"]}</div>
+                </div>
+                """,
+                unsafe_allow_html=True
+            )
+
+            st.markdown(
+                f"""
+                <div class="payment-summary">
+                    <div class="payment-card">
+                        <div class="payment-card-label">NOCHES</div>
+                        <div class="payment-card-value">{reviewed["nights"]}</div>
+                    </div>
+                    <div class="payment-card">
+                        <div class="payment-card-label">TOTAL</div>
+                        <div class="payment-card-value">{money(reviewed["total"])}</div>
+                    </div>
+                    <div class="payment-card">
+                        <div class="payment-card-label">ABONO</div>
+                        <div class="payment-card-value">{money(reviewed["deposit"])}</div>
+                    </div>
+                    <div class="payment-card">
+                        <div class="payment-card-label">SALDO INICIAL</div>
+                        <div class="payment-card-value">{money(reviewed["balance"])}</div>
+                    </div>
+                </div>
+                """,
+                unsafe_allow_html=True
+            )
+
+            st.info("La disponibilidad se comprobará recién al guardar la reserva.")
+
+            save_col, cancel_col = st.columns(2)
+
+            with save_col:
+                if st.button(
+                    "💾 Guardar reserva",
+                    type="primary",
+                    use_container_width=True,
+                    key="confirm_reservation"
+                ):
+                    # Última comprobación, justo antes de escribir en SQLite.
+                    conflict = conflict_exists(
+                        reviewed["department_id"],
+                        reviewed["check_in"],
+                        reviewed["check_out"]
+                    )
+
+                    if conflict:
+                        st.error(
+                            f"❌ No se puede guardar. El departamento ya está reservado "
+                            f"por {conflict['guest']} desde "
+                            f"{date.fromisoformat(conflict['check_in']).strftime('%d/%m/%Y')} "
+                            f"hasta {date.fromisoformat(conflict['check_out']).strftime('%d/%m/%Y')}."
+                        )
+                    else:
+                        rid = save_reservation(
+                            reviewed["department_id"],
+                            reviewed["guest"],
+                            reviewed["phone"],
+                            reviewed["check_in"],
+                            reviewed["check_in_time"].strftime("%H:%M"),
+                            reviewed["check_out"],
+                            reviewed["check_out_time"].strftime("%H:%M"),
+                            reviewed["guests"],
+                            reviewed["price"],
+                            reviewed["deposit_percent"],
+                            "Pagado completamente" if reviewed["deposit_percent"] == 100 else (
+                                "Sin abono" if reviewed["deposit_percent"] == 0 else "Abono recibido"
+                            )
+                        )
+                        st.session_state.reservation_review = None
+                        st.session_state.selected_reservation = rid
+                        st.success("Reserva guardada correctamente.")
+                        st.rerun()
+
+            with cancel_col:
+                if st.button(
+                    "Cancelar revisión",
+                    use_container_width=True,
+                    key="cancel_reservation_review"
+                ):
+                    st.session_state.reservation_review = None
+                    st.rerun()
 
     with tab_list:
         reservations = get_reservations()
@@ -1948,10 +2213,9 @@ def page_detalle():
 # =========================================================
 
 def page_calendario():
-    st.markdown('<div class="main-title">Calendario</div>', unsafe_allow_html=True)
-    st.markdown(
-        '<div class="subtitle">Consulta disponibilidad antes de ofrecer fechas.</div>',
-        unsafe_allow_html=True
+    page_section_header(
+        "Calendario",
+        "Consulta la disponibilidad de tus departamentos antes de ofrecer fechas."
     )
 
     departments = get_departments()
@@ -2144,10 +2408,9 @@ def page_calendario():
 # =========================================================
 
 def page_departamentos():
-    st.markdown('<div class="main-title">Departamentos</div>', unsafe_allow_html=True)
-    st.markdown(
-        '<div class="subtitle">Administra tus condominios, departamentos y tarifas.</div>',
-        unsafe_allow_html=True
+    page_section_header(
+        "Departamentos",
+        "Administra tus condominios, departamentos, capacidad y tarifas."
     )
 
     departments = get_departments()
@@ -2252,6 +2515,36 @@ def page_departamentos():
                         conn.close()
                         st.success("Departamento actualizado.")
                         st.rerun()
+
+                    st.markdown('<div class="danger-zone"></div>', unsafe_allow_html=True)
+
+                    if st.button(
+                        "🗑️ Eliminar departamento",
+                        key=f"delete_d_{d['id']}",
+                        use_container_width=True
+                    ):
+                        conn = db()
+                        reservation_count = conn.execute(
+                            "SELECT COUNT(*) FROM reservations WHERE department_id=?",
+                            (d["id"],)
+                        ).fetchone()[0]
+
+                        if reservation_count:
+                            conn.close()
+                            st.error(
+                                "No se puede eliminar este departamento porque "
+                                f"tiene {reservation_count} reserva(s) asociada(s). "
+                                "Elimina o gestiona primero esas reservas."
+                            )
+                        else:
+                            conn.execute(
+                                "DELETE FROM departments WHERE id=?",
+                                (d["id"],)
+                            )
+                            conn.commit()
+                            conn.close()
+                            st.success("Departamento eliminado correctamente.")
+                            st.rerun()
 
 
 # =========================================================
