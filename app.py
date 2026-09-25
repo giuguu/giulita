@@ -1,5 +1,7 @@
 import streamlit as st
-import sqlite3
+import os
+import psycopg2
+from psycopg2.extras import DictCursor
 import base64
 from datetime import date, datetime, timedelta
 from calendar import monthrange
@@ -16,7 +18,7 @@ st.set_page_config(
     initial_sidebar_state="expanded",
 )
 
-DB_PATH = Path("arriendos.db")
+# La base de datos principal está en Supabase/PostgreSQL.
 
 # Paleta
 FUCHSIA = "#D9468D"
@@ -684,107 +686,190 @@ st.markdown(
 )
 
 # =========================================================
-# BASE DE DATOS
+# BASE DE DATOS · SUPABASE / POSTGRESQL
 # =========================================================
 
+def _database_url():
+    """Obtiene la conexión guardada en Streamlit Secrets."""
+    try:
+        url = st.secrets["DATABASE_URL"]
+    except Exception:
+        url = os.getenv("DATABASE_URL")
+
+    if not url:
+        st.error(
+            "No se encontró DATABASE_URL. En Streamlit ve a Settings → Secrets "
+            "y guarda la conexión de Supabase."
+        )
+        st.stop()
+
+    return str(url)
+
+
+def _convert_placeholders(sql):
+    """Permite conservar las consultas antiguas que usan ? como marcador."""
+    return sql.replace("?", "%s")
+
+
+class PgCursor:
+    """Adaptador pequeño para mantener la sintaxis que ya usa la app."""
+
+    def __init__(self, cursor):
+        self._cursor = cursor
+
+    def execute(self, sql, params=None):
+        self._cursor.execute(_convert_placeholders(sql), params or ())
+        return self
+
+    def executemany(self, sql, seq_of_params):
+        self._cursor.executemany(_convert_placeholders(sql), seq_of_params)
+        return self
+
+    def fetchone(self):
+        return self._cursor.fetchone()
+
+    def fetchall(self):
+        return self._cursor.fetchall()
+
+    @property
+    def rowcount(self):
+        return self._cursor.rowcount
+
+    def close(self):
+        self._cursor.close()
+
+
+class PgConnection:
+    def __init__(self):
+        self._conn = psycopg2.connect(
+            _database_url(),
+            sslmode="require",
+            connect_timeout=10,
+        )
+
+    def cursor(self):
+        return PgCursor(self._conn.cursor(cursor_factory=DictCursor))
+
+    def execute(self, sql, params=None):
+        cur = self.cursor()
+        cur.execute(sql, params)
+        return cur
+
+    def commit(self):
+        self._conn.commit()
+
+    def rollback(self):
+        self._conn.rollback()
+
+    def close(self):
+        self._conn.close()
+
+
 def db():
-    conn = sqlite3.connect(DB_PATH)
-    conn.row_factory = sqlite3.Row
-    return conn
+    try:
+        return PgConnection()
+    except Exception:
+        st.error(
+            "No fue posible conectar con Supabase. Revisa DATABASE_URL en "
+            "Streamlit Secrets y confirma que estás usando la URI del Transaction pooler."
+        )
+        st.stop()
+
+
+def _existing_columns(cur, table):
+    cur.execute("""
+        SELECT column_name
+        FROM information_schema.columns
+        WHERE table_schema='public' AND table_name=?
+    """, (table,))
+    return {row["column_name"] for row in cur.fetchall()}
+
+
+def table_columns(table):
+    allowed = {"departments", "reservations", "payments", "checklist"}
+    if table not in allowed:
+        raise ValueError("Tabla no permitida")
+
+    conn = db()
+    cur = conn.cursor()
+    columns = _existing_columns(cur, table)
+    conn.close()
+    return columns
 
 
 def init_db():
+    """Crea o adapta las tablas para la versión PostgreSQL de la app."""
     conn = db()
     cur = conn.cursor()
 
-    # -----------------------------------------------------
-    # Crear tablas si no existen
-    # -----------------------------------------------------
     cur.execute("""
         CREATE TABLE IF NOT EXISTS departments (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            id BIGSERIAL PRIMARY KEY,
             condo TEXT NOT NULL DEFAULT '',
             name TEXT NOT NULL DEFAULT '',
             capacity INTEGER NOT NULL DEFAULT 2,
-            winter_price INTEGER NOT NULL DEFAULT 0,
-            summer_price INTEGER NOT NULL DEFAULT 0,
+            winter_price BIGINT NOT NULL DEFAULT 0,
+            summer_price BIGINT NOT NULL DEFAULT 0,
             active INTEGER NOT NULL DEFAULT 1
         )
     """)
 
     cur.execute("""
         CREATE TABLE IF NOT EXISTS reservations (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            department_id INTEGER NOT NULL,
+            id BIGSERIAL PRIMARY KEY,
+            department_id BIGINT NOT NULL REFERENCES departments(id),
             guest TEXT NOT NULL DEFAULT '',
+            guest_name TEXT NOT NULL DEFAULT '',
             phone TEXT DEFAULT '',
             check_in TEXT NOT NULL,
             check_in_time TEXT DEFAULT '15:00',
             check_out TEXT NOT NULL,
             check_out_time TEXT DEFAULT '11:00',
             guests INTEGER NOT NULL DEFAULT 1,
-            price_night INTEGER NOT NULL DEFAULT 0,
+            price_night BIGINT NOT NULL DEFAULT 0,
             nights INTEGER NOT NULL DEFAULT 1,
-            total INTEGER NOT NULL DEFAULT 0,
-            deposit_percent REAL NOT NULL DEFAULT 0,
-            deposited INTEGER NOT NULL DEFAULT 0,
-            status TEXT NOT NULL DEFAULT 'Sin abono',
-            FOREIGN KEY(department_id) REFERENCES departments(id)
+            total BIGINT NOT NULL DEFAULT 0,
+            deposit_percent DOUBLE PRECISION NOT NULL DEFAULT 0,
+            deposited BIGINT NOT NULL DEFAULT 0,
+            status TEXT NOT NULL DEFAULT 'Sin abono'
         )
     """)
 
     cur.execute("""
         CREATE TABLE IF NOT EXISTS payments (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            reservation_id INTEGER NOT NULL,
-            amount INTEGER NOT NULL DEFAULT 0,
-            payment_date TEXT NOT NULL,
-            note TEXT DEFAULT '',
-            FOREIGN KEY(reservation_id) REFERENCES reservations(id)
+            id BIGSERIAL PRIMARY KEY,
+            reservation_id BIGINT NOT NULL REFERENCES reservations(id) ON DELETE CASCADE,
+            amount BIGINT NOT NULL DEFAULT 0,
+            payment_date TEXT NOT NULL DEFAULT '',
+            note TEXT DEFAULT ''
         )
     """)
 
     cur.execute("""
         CREATE TABLE IF NOT EXISTS checklist (
-            reservation_id INTEGER PRIMARY KEY,
+            id BIGSERIAL PRIMARY KEY,
+            reservation_id BIGINT NOT NULL UNIQUE REFERENCES reservations(id) ON DELETE CASCADE,
             cleaning INTEGER NOT NULL DEFAULT 0,
             internet INTEGER NOT NULL DEFAULT 0,
             inspected INTEGER NOT NULL DEFAULT 0,
-            keys INTEGER NOT NULL DEFAULT 0,
-            FOREIGN KEY(reservation_id) REFERENCES reservations(id)
+            keys INTEGER NOT NULL DEFAULT 0
         )
     """)
 
-    # -----------------------------------------------------
-    # MIGRACIÓN:
-    # Si existe una base de datos antigua, agrega las
-    # columnas que necesita esta versión.
-    # -----------------------------------------------------
-    def existing_columns(table):
-        return {
-            row[1]
-            for row in cur.execute(f"PRAGMA table_info({table})").fetchall()
-        }
-
     def add_column_if_missing(table, column, definition):
-        columns = existing_columns(table)
+        columns = _existing_columns(cur, table)
         if column not in columns:
-            cur.execute(
-                f"ALTER TABLE {table} ADD COLUMN {column} {definition}"
-            )
+            cur.execute(f'ALTER TABLE {table} ADD COLUMN {column} {definition}')
 
-    # Departamentos antiguos
     add_column_if_missing("departments", "condo", "TEXT NOT NULL DEFAULT ''")
     add_column_if_missing("departments", "name", "TEXT NOT NULL DEFAULT ''")
     add_column_if_missing("departments", "capacity", "INTEGER NOT NULL DEFAULT 2")
-    add_column_if_missing("departments", "winter_price", "INTEGER NOT NULL DEFAULT 0")
-    add_column_if_missing("departments", "summer_price", "INTEGER NOT NULL DEFAULT 0")
+    add_column_if_missing("departments", "winter_price", "BIGINT NOT NULL DEFAULT 0")
+    add_column_if_missing("departments", "summer_price", "BIGINT NOT NULL DEFAULT 0")
     add_column_if_missing("departments", "active", "INTEGER NOT NULL DEFAULT 1")
 
-    # Compatibilidad con una versión anterior que usaba la columna
-    # "condominium" en lugar de "condo".
-    department_columns = existing_columns("departments")
-    if "condominium" in department_columns:
+    dept_cols = _existing_columns(cur, "departments")
+    if "condominium" in dept_cols:
         cur.execute("""
             UPDATE departments
             SET condo = condominium
@@ -792,37 +877,54 @@ def init_db():
               AND condominium IS NOT NULL
         """)
 
-    # Reservas antiguas
-    add_column_if_missing("reservations", "department_id", "INTEGER NOT NULL DEFAULT 1")
+    add_column_if_missing("reservations", "department_id", "BIGINT")
     add_column_if_missing("reservations", "guest", "TEXT NOT NULL DEFAULT ''")
-    # Compatibilidad con una versión que utilizaba "guest_name".
-    # No eliminamos esa columna para conservar la base de datos existente.
     add_column_if_missing("reservations", "guest_name", "TEXT NOT NULL DEFAULT ''")
-    cur.execute("""
-        UPDATE reservations
-        SET guest_name = guest
-        WHERE (guest_name IS NULL OR TRIM(guest_name) = '')
-          AND guest IS NOT NULL
-    """)
     add_column_if_missing("reservations", "phone", "TEXT DEFAULT ''")
     add_column_if_missing("reservations", "check_in", "TEXT NOT NULL DEFAULT '2000-01-01'")
     add_column_if_missing("reservations", "check_in_time", "TEXT DEFAULT '15:00'")
     add_column_if_missing("reservations", "check_out", "TEXT NOT NULL DEFAULT '2000-01-02'")
     add_column_if_missing("reservations", "check_out_time", "TEXT DEFAULT '11:00'")
     add_column_if_missing("reservations", "guests", "INTEGER NOT NULL DEFAULT 1")
-    add_column_if_missing("reservations", "price_night", "INTEGER NOT NULL DEFAULT 0")
+    add_column_if_missing("reservations", "price_night", "BIGINT NOT NULL DEFAULT 0")
     add_column_if_missing("reservations", "nights", "INTEGER NOT NULL DEFAULT 1")
-    add_column_if_missing("reservations", "total", "INTEGER NOT NULL DEFAULT 0")
-    add_column_if_missing("reservations", "deposit_percent", "REAL NOT NULL DEFAULT 0")
-    add_column_if_missing("reservations", "deposited", "INTEGER NOT NULL DEFAULT 0")
+    add_column_if_missing("reservations", "total", "BIGINT NOT NULL DEFAULT 0")
+    add_column_if_missing("reservations", "deposit_percent", "DOUBLE PRECISION NOT NULL DEFAULT 0")
+    add_column_if_missing("reservations", "deposited", "BIGINT NOT NULL DEFAULT 0")
     add_column_if_missing("reservations", "status", "TEXT NOT NULL DEFAULT 'Sin abono'")
 
-    # Tablas auxiliares: si no existían, ya fueron creadas arriba.
-    # -----------------------------------------------------
+    res_cols = _existing_columns(cur, "reservations")
+    if "nightly_price" in res_cols:
+        cur.execute("""
+            UPDATE reservations
+            SET price_night = nightly_price
+            WHERE COALESCE(price_night, 0) = 0
+              AND nightly_price IS NOT NULL
+        """)
 
-    # Datos iniciales solo si no existen departamentos.
-    count = cur.execute("SELECT COUNT(*) FROM departments").fetchone()[0]
+    cur.execute("""
+        UPDATE reservations
+        SET guest_name = guest
+        WHERE (guest_name IS NULL OR TRIM(guest_name) = '')
+          AND guest IS NOT NULL
+    """)
 
+    add_column_if_missing("payments", "payment_date", "TEXT NOT NULL DEFAULT ''")
+    payment_cols = _existing_columns(cur, "payments")
+    if "date" in payment_cols:
+        cur.execute("""
+            UPDATE payments
+            SET payment_date = "date"
+            WHERE (payment_date IS NULL OR TRIM(payment_date) = '')
+              AND "date" IS NOT NULL
+        """)
+
+    add_column_if_missing("checklist", "cleaning", "INTEGER NOT NULL DEFAULT 0")
+    add_column_if_missing("checklist", "internet", "INTEGER NOT NULL DEFAULT 0")
+    add_column_if_missing("checklist", "inspected", "INTEGER NOT NULL DEFAULT 0")
+    add_column_if_missing("checklist", "keys", "INTEGER NOT NULL DEFAULT 0")
+
+    count = cur.execute("SELECT COUNT(*) AS total FROM departments").fetchone()["total"]
     if count == 0:
         departments = [
             ("Serena Pacífico", "Depto 101", 4, 60000, 90000),
@@ -835,86 +937,11 @@ def init_db():
             ("Oceanic", "Depto 101", 4, 65000, 95000),
             ("Oceanic", "Depto 202", 5, 70000, 105000),
         ]
-
         cur.executemany("""
             INSERT INTO departments
             (condo, name, capacity, winter_price, summer_price)
             VALUES (?, ?, ?, ?, ?)
         """, departments)
-
-    # Reservas de ejemplo solo si no existen.
-    rcount = cur.execute("SELECT COUNT(*) FROM reservations").fetchone()[0]
-
-    if rcount == 0:
-        dept = cur.execute("""
-            SELECT id FROM departments
-            WHERE condo='Serena Pacífico' AND name='Depto 305'
-            LIMIT 1
-        """).fetchone()
-
-        dept2 = cur.execute("""
-            SELECT id FROM departments
-            WHERE condo='Oceanic' AND name='Depto 101'
-            LIMIT 1
-        """).fetchone()
-
-        today = date.today()
-        r1_in = today + timedelta(days=2)
-        r1_out = today + timedelta(days=6)
-        r2_in = today + timedelta(days=8)
-        r2_out = today + timedelta(days=11)
-
-        if dept:
-            nights = (r1_out - r1_in).days
-            total = nights * 70000
-
-            cur.execute("""
-                INSERT INTO reservations
-                (department_id, guest, phone, check_in, check_in_time,
-                 check_out, check_out_time, guests, price_night, nights,
-                 total, deposit_percent, deposited, status)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-            """, (
-                dept["id"], "María González", "+56 9 1234 5678",
-                r1_in.isoformat(), "15:00",
-                r1_out.isoformat(), "11:00",
-                4, 70000, nights, total, 30,
-                int(total * 0.30), "Abono recibido"
-            ))
-
-            rid = cur.lastrowid
-
-            cur.execute("""
-                INSERT INTO checklist
-                (reservation_id, cleaning, internet, inspected, keys)
-                VALUES (?, 0, 1, 0, 1)
-            """, (rid,))
-
-        if dept2:
-            nights = (r2_out - r2_in).days
-            total = nights * 65000
-
-            cur.execute("""
-                INSERT INTO reservations
-                (department_id, guest, phone, check_in, check_in_time,
-                 check_out, check_out_time, guests, price_night, nights,
-                 total, deposit_percent, deposited, status)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-            """, (
-                dept2["id"], "Carlos Rojas", "+56 9 9876 5432",
-                r2_in.isoformat(), "16:00",
-                r2_out.isoformat(), "11:00",
-                3, 65000, nights, total, 100,
-                total, "Pagado completamente"
-            ))
-
-            rid = cur.lastrowid
-
-            cur.execute("""
-                INSERT INTO checklist
-                (reservation_id, cleaning, internet, inspected, keys)
-                VALUES (?, 1, 1, 1, 1)
-            """, (rid,))
 
     conn.commit()
     conn.close()
@@ -931,16 +958,13 @@ def money(value):
 
 
 def department_columns():
-    conn = db()
-    cols = {row[1] for row in conn.execute("PRAGMA table_info(departments)").fetchall()}
-    conn.close()
-    return cols
+    return table_columns("departments")
 
 
 def insert_department(condo, name, capacity, winter, summer):
-    """Inserta un departamento y es compatible con bases antiguas."""
+    """Inserta un departamento y mantiene compatibilidad con esquemas antiguos."""
     conn = db()
-    cols = {row[1] for row in conn.execute("PRAGMA table_info(departments)").fetchall()}
+    cols = department_columns()
 
     if "condominium" in cols:
         conn.execute("""
@@ -1036,13 +1060,9 @@ def save_reservation(
 
     conn = db()
     cur = conn.cursor()
-
-    reservation_columns = {
-        row[1] for row in cur.execute("PRAGMA table_info(reservations)").fetchall()
-    }
+    reservation_columns = table_columns("reservations")
 
     if reservation_id:
-        # Mantiene compatibilidad con bases antiguas que tienen guest_name.
         if "guest_name" in reservation_columns:
             cur.execute("""
                 UPDATE reservations
@@ -1080,6 +1100,7 @@ def save_reservation(
                  check_out, check_out_time, guests, price_night, nights,
                  total, deposit_percent, deposited, status)
                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                RETURNING id
             """, (
                 department_id, guest, guest, phone, check_in.isoformat(),
                 check_in_time, check_out.isoformat(), check_out_time,
@@ -1093,18 +1114,21 @@ def save_reservation(
                  check_out, check_out_time, guests, price_night, nights,
                  total, deposit_percent, deposited, status)
                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                RETURNING id
             """, (
                 department_id, guest, phone, check_in.isoformat(),
                 check_in_time, check_out.isoformat(), check_out_time,
                 guests, price_night, nights, total,
                 deposit_percent, deposited, status
             ))
-        rid = cur.lastrowid
+
+        rid = cur.fetchone()["id"]
 
         cur.execute("""
-            INSERT OR IGNORE INTO checklist
+            INSERT INTO checklist
             (reservation_id, cleaning, internet, inspected, keys)
             VALUES (?, 0, 0, 0, 0)
+            ON CONFLICT (reservation_id) DO NOTHING
         """, (rid,))
 
     conn.commit()
@@ -2498,7 +2522,7 @@ def page_departamentos():
 
                     if st.button("Guardar", key=f"save_d_{d['id']}"):
                         conn = db()
-                        cols = {row[1] for row in conn.execute("PRAGMA table_info(departments)").fetchall()}
+                        cols = department_columns()
                         if "condominium" in cols:
                             conn.execute("""
                                 UPDATE departments
