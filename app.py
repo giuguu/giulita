@@ -3,6 +3,7 @@ import os
 import psycopg2
 from psycopg2.extras import DictCursor
 import base64
+import unicodedata
 from datetime import date, datetime, timedelta
 from calendar import monthrange
 from pathlib import Path
@@ -185,6 +186,98 @@ st.markdown(
         padding: 18px;
         min-height: 175px;
         box-shadow: 0 5px 18px rgba(217,70,141,0.06);
+    }}
+
+    .building-card {{
+        position: relative;
+        border-radius: 22px;
+        overflow: hidden;
+        min-height: 220px;
+        margin: 8px 0 10px;
+        background: linear-gradient(135deg, #d9468d 0%, #b83272 100%);
+        box-shadow: 0 8px 24px rgba(217,70,141,0.10);
+    }}
+
+    .building-card img {{
+        position: absolute;
+        inset: 0;
+        width: 100%;
+        height: 100%;
+        object-fit: cover;
+    }}
+
+    .building-overlay {{
+        position: absolute;
+        inset: 0;
+        background: linear-gradient(90deg, rgba(42,35,48,.78) 0%, rgba(42,35,48,.43) 56%, rgba(42,35,48,.12) 100%);
+    }}
+
+    .building-content {{
+        position: relative;
+        z-index: 2;
+        min-height: 220px;
+        padding: 28px;
+        display: flex;
+        flex-direction: column;
+        justify-content: flex-end;
+    }}
+
+    .building-kicker {{
+        color: #FFE7F3;
+        font-size: .78rem;
+        font-weight: 800;
+        text-transform: uppercase;
+        letter-spacing: .08em;
+    }}
+
+    .building-name {{
+        color: white;
+        font-size: 1.75rem;
+        font-weight: 850;
+        line-height: 1.05;
+        margin-top: 6px;
+    }}
+
+    .building-count {{
+        color: rgba(255,255,255,.92);
+        font-size: .92rem;
+        margin-top: 8px;
+    }}
+
+    .building-fallback {{
+        background: linear-gradient(135deg, #d9468d 0%, #b83272 60%, #8f285d 100%);
+    }}
+
+    .departments-inside {{
+        background: rgba(255,255,255,.60);
+        border-radius: 18px;
+        padding: 6px 0 2px;
+        margin-bottom: 12px;
+    }}
+
+    .search-result-card {{
+        background: {WHITE};
+        border: 1px solid {PINK_BORDER};
+        border-radius: 18px;
+        padding: 17px;
+        min-height: 150px;
+        box-shadow: 0 5px 18px rgba(217,70,141,0.05);
+        margin-bottom: 10px;
+    }}
+
+    .search-result-building {{
+        color: {FUCHSIA_DARK};
+        font-size: .78rem;
+        font-weight: 800;
+        text-transform: uppercase;
+        letter-spacing: .04em;
+    }}
+
+    .search-result-name {{
+        color: {TEXT};
+        font-size: 1.08rem;
+        font-weight: 850;
+        margin: 4px 0 9px;
     }}
 
     .dept-name {{
@@ -1367,6 +1460,62 @@ def _portada_data_uri():
     return None
 
 
+def _slug_archivo(texto):
+    """Convierte un nombre de condominio a un nombre de archivo simple."""
+    normalizado = unicodedata.normalize("NFKD", str(texto))
+    normalizado = "".join(c for c in normalizado if not unicodedata.combining(c))
+    limpio = "".join(c.lower() if c.isalnum() else "_" for c in normalizado)
+    while "__" in limpio:
+        limpio = limpio.replace("__", "_")
+    return limpio.strip("_")
+
+
+def _archivo_a_data_uri(file_path):
+    """Convierte una imagen local a data URI para usarla dentro de las tarjetas."""
+    try:
+        if not file_path.exists() or not file_path.is_file():
+            return None
+        tipos = {
+            ".jpg": "image/jpeg",
+            ".jpeg": "image/jpeg",
+            ".png": "image/png",
+            ".webp": "image/webp",
+        }
+        mime = tipos.get(file_path.suffix.lower())
+        if not mime:
+            return None
+        encoded = base64.b64encode(file_path.read_bytes()).decode("utf-8")
+        return f"data:{mime};base64,{encoded}"
+    except Exception:
+        return None
+
+
+def _condo_image_data_uri(condo):
+    """
+    Busca una foto para cada edificio/condominio.
+
+    Ejemplo: "Serena Pacífico" -> serena_pacifico.jpg
+    También acepta edificio_serena_pacifico.jpg.
+    Busca en la carpeta principal, assets y assets/edificios.
+    """
+    base_dir = Path(__file__).resolve().parent
+    slug = _slug_archivo(condo)
+    carpetas = [base_dir, base_dir / "assets", base_dir / "assets" / "edificios"]
+    nombres_base = [slug, f"edificio_{slug}", f"condominio_{slug}"]
+    extensiones = [".jpg", ".jpeg", ".png", ".webp"]
+
+    for carpeta in carpetas:
+        for nombre in nombres_base:
+            for extension in extensiones:
+                uri = _archivo_a_data_uri(carpeta / f"{nombre}{extension}")
+                if uri:
+                    return uri
+
+    # Si todavía no tienes una foto específica del edificio,
+    # se usa portada.jpg para que la tarjeta nunca quede vacía.
+    return _portada_data_uri()
+
+
 _MESES = [
     "enero", "febrero", "marzo", "abril", "mayo", "junio",
     "julio", "agosto", "septiembre", "octubre", "noviembre", "diciembre"
@@ -2374,8 +2523,12 @@ def page_calendario():
     st.divider()
 
     st.markdown('<div class="section-title">🔎 Buscar disponibilidad</div>', unsafe_allow_html=True)
+    st.caption("Filtra por fechas, edificio y capacidad mínima de huéspedes.")
 
-    b1, b2 = st.columns(2)
+    max_capacity = max(int(d["capacity"]) for d in departments) if departments else 1
+    search_condos = ["Todos los edificios"] + sorted({d["condo"] for d in departments})
+
+    b1, b2, b3, b4 = st.columns([1.15, 1.15, 1, 1.35])
 
     with b1:
         search_in = st.date_input(
@@ -2391,9 +2544,28 @@ def page_calendario():
             key="search_out"
         )
 
+    with b3:
+        min_capacity = st.number_input(
+            "Capacidad mínima",
+            min_value=1,
+            max_value=max_capacity,
+            value=min(4, max_capacity),
+            step=1,
+            key="search_capacity",
+            help="Ejemplo: si eliges 5, aparecerán departamentos para 5 o más personas."
+        )
+
+    with b4:
+        search_condo = st.selectbox(
+            "Edificio / condominio",
+            search_condos,
+            key="search_condo"
+        )
+
     if st.button(
-        "Buscar departamentos disponibles",
-        type="primary"
+        "🔍 Buscar departamentos disponibles",
+        type="primary",
+        use_container_width=True
     ):
         if search_out <= search_in:
             st.error("La salida debe ser posterior a la entrada.")
@@ -2401,6 +2573,11 @@ def page_calendario():
             available = []
 
             for d in departments:
+                if int(d["capacity"]) < int(min_capacity):
+                    continue
+                if search_condo != "Todos los edificios" and d["condo"] != search_condo:
+                    continue
+
                 conflict = conflict_exists(
                     d["id"], search_in, search_out
                 )
@@ -2408,23 +2585,37 @@ def page_calendario():
                     available.append(d)
 
             if available:
-                st.success(f"Encontramos {len(available)} departamento(s) disponible(s).")
+                st.success(
+                    f"Encontramos {len(available)} departamento(s) disponible(s) "
+                    f"para {int(min_capacity)} o más huésped(es)."
+                )
 
-                for d in available:
-                    st.markdown(
-                        f"""
-                        <div class="detail-box">
-                            <b>{d['condo']} · {d['name']}</b><br>
-                            <span style="color:{MUTED}">
-                            Capacidad: {d['capacity']} ·
-                            Precio verano: {money(d['summer_price'])}
-                            </span>
-                        </div>
-                        """,
-                        unsafe_allow_html=True
-                    )
+                nights_search = (search_out - search_in).days
+                result_cols = st.columns(3)
+
+                for i, d in enumerate(available):
+                    with result_cols[i % 3]:
+                        total_reference = nights_search * int(d["summer_price"])
+                        st.markdown(
+                            f"""
+                            <div class="search-result-card">
+                                <div class="search-result-building">🏢 {d['condo']}</div>
+                                <div class="search-result-name">{d['name']}</div>
+                                <div>👥 Hasta {d['capacity']} huéspedes</div>
+                                <div>🌙 {nights_search} noche(s)</div>
+                                <div>☀️ Verano · {money(d['summer_price'])} / noche</div>
+                                <div style="margin-top:7px;font-weight:800;color:{FUCHSIA_DARK}">
+                                    Referencia verano: {money(total_reference)}
+                                </div>
+                            </div>
+                            """,
+                            unsafe_allow_html=True
+                        )
             else:
-                st.error("No hay departamentos disponibles para esas fechas.")
+                st.warning(
+                    "No encontramos departamentos disponibles con esas fechas y capacidad. "
+                    "Prueba cambiando las fechas, el edificio o la capacidad mínima."
+                )
 
 
 # =========================================================
@@ -2434,14 +2625,14 @@ def page_calendario():
 def page_departamentos():
     page_section_header(
         "Departamentos",
-        "Administra tus condominios, departamentos, capacidad y tarifas."
+        "Explora tus edificios y administra los departamentos de cada uno."
     )
 
     departments = get_departments()
 
     with st.expander("＋ Agregar departamento"):
-        st.caption("Puedes registrar todos los departamentos que necesites dentro del mismo condominio.")
-        condo = st.text_input("Condominio", placeholder="Ej. Serena Pacífico")
+        st.caption("Puedes registrar todos los departamentos que necesites dentro del mismo edificio o condominio.")
+        condo = st.text_input("Edificio / condominio", placeholder="Ej. Serena Pacífico")
         name = st.text_input("Nombre o número del departamento", placeholder="Ej. Depto 305")
         capacity = st.number_input("Capacidad", min_value=1, value=4)
         winter = st.number_input("Precio noche invierno", min_value=0, value=60000, step=5000)
@@ -2449,7 +2640,7 @@ def page_departamentos():
 
         if st.button("Agregar departamento", type="primary"):
             if not condo.strip() or not name.strip():
-                st.warning("Completa el condominio y el departamento.")
+                st.warning("Completa el edificio/condominio y el departamento.")
             else:
                 insert_department(
                     condo.strip(),
@@ -2465,110 +2656,157 @@ def page_departamentos():
         st.info("No hay departamentos registrados.")
         return
 
-    # Agrupar por condominio
     condos = {}
     for d in departments:
         condos.setdefault(d["condo"], []).append(d)
 
-    for condo, deps in condos.items():
-        st.markdown(
-            f'<div class="section-title">🏢 {condo} <span style="color:{MUTED};font-size:.78rem;font-weight:600">· {len(deps)} departamento(s)</span></div>',
-            unsafe_allow_html=True
-        )
+    st.markdown('<div class="section-title">Tus edificios</div>', unsafe_allow_html=True)
+    st.caption("Presiona cada edificio para mostrar u ocultar sus departamentos.")
 
-        cols = st.columns(3)
+    for condo, deps in sorted(condos.items(), key=lambda item: item[0].lower()):
+        slug = _slug_archivo(condo)
+        state_key = f"condo_open_{slug}"
+        if state_key not in st.session_state:
+            st.session_state[state_key] = False
 
-        for i, d in enumerate(deps):
-            with cols[i % 3]:
+        image_uri = _condo_image_data_uri(condo)
+
+        with st.container(border=True):
+            if image_uri:
                 st.markdown(
                     f"""
-                    <div class="dept-card">
-                        <div class="dept-name">{d['name']}</div>
-                        <div class="dept-condo">{d['condo']}</div>
-                        <div>👥 Hasta {d['capacity']} huéspedes</div>
-                        <div>❄️ Invierno · {money(d['winter_price'])}</div>
-                        <div>☀️ Verano · {money(d['summer_price'])}</div>
+                    <div class="building-card">
+                        <img src="{image_uri}" alt="{condo}">
+                        <div class="building-overlay"></div>
+                        <div class="building-content">
+                            <div class="building-kicker">Edificio / condominio</div>
+                            <div class="building-name">{condo}</div>
+                            <div class="building-count">🏠 {len(deps)} departamento(s)</div>
+                        </div>
+                    </div>
+                    """,
+                    unsafe_allow_html=True
+                )
+            else:
+                st.markdown(
+                    f"""
+                    <div class="building-card building-fallback">
+                        <div class="building-content">
+                            <div class="building-kicker">Edificio / condominio</div>
+                            <div class="building-name">{condo}</div>
+                            <div class="building-count">🏠 {len(deps)} departamento(s)</div>
+                        </div>
                     </div>
                     """,
                     unsafe_allow_html=True
                 )
 
-                with st.expander("Editar"):
-                    new_name = st.text_input(
-                        "Nombre",
-                        value=d["name"],
-                        key=f"dn_{d['id']}"
-                    )
-                    new_capacity = st.number_input(
-                        "Capacidad",
-                        min_value=1,
-                        value=int(d["capacity"]),
-                        key=f"dc_{d['id']}"
-                    )
-                    new_winter = st.number_input(
-                        "Invierno",
-                        min_value=0,
-                        value=int(d["winter_price"]),
-                        step=5000,
-                        key=f"dw_{d['id']}"
-                    )
-                    new_summer = st.number_input(
-                        "Verano",
-                        min_value=0,
-                        value=int(d["summer_price"]),
-                        step=5000,
-                        key=f"ds_{d['id']}"
-                    )
+            is_open = bool(st.session_state[state_key])
+            button_text = "▲ Ocultar departamentos" if is_open else "▼ Ver departamentos"
 
-                    if st.button("Guardar", key=f"save_d_{d['id']}"):
-                        conn = db()
-                        cols = department_columns()
-                        if "condominium" in cols:
-                            conn.execute("""
-                                UPDATE departments
-                                SET name=?, capacity=?, winter_price=?, summer_price=?, condominium=condo
-                                WHERE id=?
-                            """, (new_name, new_capacity, new_winter, new_summer, d["id"]))
-                        else:
-                            conn.execute("""
-                                UPDATE departments
-                                SET name=?, capacity=?, winter_price=?, summer_price=?
-                                WHERE id=?
-                            """, (new_name, new_capacity, new_winter, new_summer, d["id"]))
-                        conn.commit()
-                        conn.close()
-                        st.success("Departamento actualizado.")
-                        st.rerun()
+            if st.button(
+                button_text,
+                key=f"toggle_{slug}",
+                use_container_width=True
+            ):
+                st.session_state[state_key] = not is_open
+                st.rerun()
 
-                    st.markdown('<div class="danger-zone"></div>', unsafe_allow_html=True)
+            if st.session_state[state_key]:
+                st.markdown('<div class="departments-inside"></div>', unsafe_allow_html=True)
+                dept_cols = st.columns(3)
 
-                    if st.button(
-                        "🗑️ Eliminar departamento",
-                        key=f"delete_d_{d['id']}",
-                        use_container_width=True
-                    ):
-                        conn = db()
-                        reservation_count = conn.execute(
-                            "SELECT COUNT(*) FROM reservations WHERE department_id=?",
-                            (d["id"],)
-                        ).fetchone()[0]
+                for i, d in enumerate(deps):
+                    with dept_cols[i % 3]:
+                        st.markdown(
+                            f"""
+                            <div class="dept-card">
+                                <div class="dept-name">{d['name']}</div>
+                                <div class="dept-condo">{d['condo']}</div>
+                                <div>👥 Hasta {d['capacity']} huéspedes</div>
+                                <div>❄️ Invierno · {money(d['winter_price'])}</div>
+                                <div>☀️ Verano · {money(d['summer_price'])}</div>
+                            </div>
+                            """,
+                            unsafe_allow_html=True
+                        )
 
-                        if reservation_count:
-                            conn.close()
-                            st.error(
-                                "No se puede eliminar este departamento porque "
-                                f"tiene {reservation_count} reserva(s) asociada(s). "
-                                "Elimina o gestiona primero esas reservas."
+                        with st.expander("Modificar"):
+                            new_name = st.text_input(
+                                "Nombre",
+                                value=d["name"],
+                                key=f"dn_{d['id']}"
                             )
-                        else:
-                            conn.execute(
-                                "DELETE FROM departments WHERE id=?",
-                                (d["id"],)
+                            new_capacity = st.number_input(
+                                "Capacidad",
+                                min_value=1,
+                                value=int(d["capacity"]),
+                                key=f"dc_{d['id']}"
                             )
-                            conn.commit()
-                            conn.close()
-                            st.success("Departamento eliminado correctamente.")
-                            st.rerun()
+                            new_winter = st.number_input(
+                                "Invierno",
+                                min_value=0,
+                                value=int(d["winter_price"]),
+                                step=5000,
+                                key=f"dw_{d['id']}"
+                            )
+                            new_summer = st.number_input(
+                                "Verano",
+                                min_value=0,
+                                value=int(d["summer_price"]),
+                                step=5000,
+                                key=f"ds_{d['id']}"
+                            )
+
+                            if st.button("Guardar cambios", key=f"save_d_{d['id']}", use_container_width=True):
+                                conn = db()
+                                cols_db = department_columns()
+                                if "condominium" in cols_db:
+                                    conn.execute("""
+                                        UPDATE departments
+                                        SET name=?, capacity=?, winter_price=?, summer_price=?, condominium=condo
+                                        WHERE id=?
+                                    """, (new_name, new_capacity, new_winter, new_summer, d["id"]))
+                                else:
+                                    conn.execute("""
+                                        UPDATE departments
+                                        SET name=?, capacity=?, winter_price=?, summer_price=?
+                                        WHERE id=?
+                                    """, (new_name, new_capacity, new_winter, new_summer, d["id"]))
+                                conn.commit()
+                                conn.close()
+                                st.success("Departamento actualizado.")
+                                st.rerun()
+
+                            st.markdown('<div class="danger-zone"></div>', unsafe_allow_html=True)
+
+                            if st.button(
+                                "🗑️ Eliminar departamento",
+                                key=f"delete_d_{d['id']}",
+                                use_container_width=True
+                            ):
+                                conn = db()
+                                reservation_count = conn.execute(
+                                    "SELECT COUNT(*) FROM reservations WHERE department_id=?",
+                                    (d["id"],)
+                                ).fetchone()[0]
+
+                                if reservation_count:
+                                    conn.close()
+                                    st.error(
+                                        "No se puede eliminar este departamento porque "
+                                        f"tiene {reservation_count} reserva(s) asociada(s). "
+                                        "Elimina o gestiona primero esas reservas."
+                                    )
+                                else:
+                                    conn.execute(
+                                        "DELETE FROM departments WHERE id=?",
+                                        (d["id"],)
+                                    )
+                                    conn.commit()
+                                    conn.close()
+                                    st.success("Departamento eliminado correctamente.")
+                                    st.rerun()
 
 
 # =========================================================
