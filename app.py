@@ -2,6 +2,7 @@ import streamlit as st
 import os
 import psycopg2
 from psycopg2.extras import DictCursor
+from psycopg2.pool import ThreadedConnectionPool
 import base64
 import unicodedata
 from datetime import date, datetime, timedelta
@@ -832,13 +833,31 @@ class PgCursor:
         self._cursor.close()
 
 
+@st.cache_resource
+def _connection_pool():
+    """Reutiliza conexiones a Supabase para evitar reconectar en cada rerun."""
+    return ThreadedConnectionPool(
+        minconn=1,
+        maxconn=5,
+        dsn=_database_url(),
+        sslmode="require",
+        connect_timeout=10,
+    )
+
+
 class PgConnection:
     def __init__(self):
-        self._conn = psycopg2.connect(
-            _database_url(),
-            sslmode="require",
-            connect_timeout=10,
-        )
+        self._pool = _connection_pool()
+        self._conn = self._pool.getconn()
+        self._released = False
+
+        # Si Supabase cerró una conexión inactiva, la reemplazamos.
+        if self._conn.closed:
+            try:
+                self._pool.putconn(self._conn, close=True)
+            except Exception:
+                pass
+            self._conn = self._pool.getconn()
 
     def cursor(self):
         return PgCursor(self._conn.cursor(cursor_factory=DictCursor))
@@ -855,7 +874,18 @@ class PgConnection:
         self._conn.rollback()
 
     def close(self):
-        self._conn.close()
+        if self._released:
+            return
+        try:
+            # Las consultas SELECT también abren una transacción en psycopg2.
+            # La dejamos limpia antes de devolverla al pool.
+            self._conn.rollback()
+        except Exception:
+            pass
+        try:
+            self._pool.putconn(self._conn)
+        finally:
+            self._released = True
 
 
 def db():
@@ -890,8 +920,9 @@ def table_columns(table):
     return columns
 
 
+@st.cache_resource
 def init_db():
-    """Crea o adapta las tablas para la versión PostgreSQL de la app."""
+    """Crea/adapta el esquema una sola vez por proceso de Streamlit."""
     conn = db()
     cur = conn.cursor()
 
@@ -1436,6 +1467,7 @@ with st.sidebar:
 # INICIO
 # =========================================================
 
+@st.cache_data(show_spinner=False)
 def _portada_data_uri():
     """Busca automáticamente una imagen cuyo nombre sea portada."""
     base_dir = Path(__file__).resolve().parent
@@ -1505,9 +1537,9 @@ def _archivo_a_data_uri(file_path):
         return None
 
 
-def _get_condo_image_row(condo):
-    """Obtiene la fotografía persistente de un edificio desde Supabase."""
-    condo_key = _slug_archivo(condo)
+@st.cache_data(ttl=3600, show_spinner=False)
+def _get_condo_image_cached(condo_key):
+    """Trae una foto de Supabase y la mantiene en caché para evitar descargas repetidas."""
     if not condo_key:
         return None
 
@@ -1517,9 +1549,16 @@ def _get_condo_image_row(condo):
             "SELECT image_data, image_mime FROM condo_images WHERE condo_key=?",
             (condo_key,)
         ).fetchone()
-        return row
+        if not row or not row["image_data"]:
+            return None
+        return bytes(row["image_data"]), (row["image_mime"] or "image/jpeg")
     finally:
         conn.close()
+
+
+def _get_condo_image_row(condo):
+    """Compatibilidad: devuelve los bytes/mime cacheados del edificio."""
+    return _get_condo_image_cached(_slug_archivo(condo))
 
 
 def _condo_has_saved_image(condo):
@@ -1566,6 +1605,7 @@ def save_condo_image(condo, uploaded_file):
             (condo_key, condo_name, psycopg2.Binary(image_bytes), mime)
         )
         conn.commit()
+        _get_condo_image_cached.clear()
     except Exception:
         conn.rollback()
         raise
@@ -1585,6 +1625,7 @@ def delete_condo_image_if_unused(condo):
         if int(remaining) == 0:
             conn.execute("DELETE FROM condo_images WHERE condo_key=?", (condo_key,))
             conn.commit()
+            _get_condo_image_cached.clear()
     finally:
         conn.close()
 
@@ -1595,10 +1636,9 @@ def _condo_image_data_uri(condo):
     Si aún no existe, prueba archivos locales y finalmente portada.jpg.
     """
     saved = _get_condo_image_row(condo)
-    if saved and saved["image_data"]:
+    if saved:
         try:
-            raw = bytes(saved["image_data"])
-            mime = saved["image_mime"] or "image/jpeg"
+            raw, mime = saved
             encoded = base64.b64encode(raw).decode("utf-8")
             return f"data:{mime};base64,{encoded}"
         except Exception:
