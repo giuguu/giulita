@@ -949,6 +949,21 @@ def init_db():
         )
     """)
 
+    # Una sola fotografía por edificio/condominio. Se guarda en Supabase
+    # para que no se pierda cuando Streamlit se reinicie.
+    cur.execute("""
+        CREATE TABLE IF NOT EXISTS condo_images (
+            condo_key TEXT PRIMARY KEY,
+            condo_name TEXT NOT NULL DEFAULT '',
+            image_data BYTEA NOT NULL,
+            image_mime TEXT NOT NULL DEFAULT 'image/jpeg',
+            updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+        )
+    """)
+    # Supabase puede exponer las tablas nuevas mediante Data API.
+    # Activamos RLS para que la foto no quede accesible públicamente por la API.
+    cur.execute("ALTER TABLE condo_images ENABLE ROW LEVEL SECURITY")
+
     def add_column_if_missing(table, column, definition):
         columns = _existing_columns(cur, table)
         if column not in columns:
@@ -1490,14 +1505,105 @@ def _archivo_a_data_uri(file_path):
         return None
 
 
+def _get_condo_image_row(condo):
+    """Obtiene la fotografía persistente de un edificio desde Supabase."""
+    condo_key = _slug_archivo(condo)
+    if not condo_key:
+        return None
+
+    conn = db()
+    try:
+        row = conn.execute(
+            "SELECT image_data, image_mime FROM condo_images WHERE condo_key=?",
+            (condo_key,)
+        ).fetchone()
+        return row
+    finally:
+        conn.close()
+
+
+def _condo_has_saved_image(condo):
+    return _get_condo_image_row(condo) is not None
+
+
+def save_condo_image(condo, uploaded_file):
+    """Guarda o reemplaza la fotografía de un edificio en Supabase."""
+    if uploaded_file is None:
+        return
+
+    image_bytes = uploaded_file.getvalue()
+    if not image_bytes:
+        raise ValueError("La imagen está vacía.")
+
+    # Evita guardar fotografías enormes dentro de PostgreSQL.
+    max_bytes = 5 * 1024 * 1024
+    if len(image_bytes) > max_bytes:
+        raise ValueError("La imagen supera 5 MB. Usa una foto más liviana.")
+
+    mime = getattr(uploaded_file, "type", None) or "image/jpeg"
+    allowed_mimes = {"image/jpeg", "image/png", "image/webp"}
+    if mime not in allowed_mimes:
+        raise ValueError("Formato no permitido. Usa JPG, PNG o WEBP.")
+
+    condo_name = str(condo).strip()
+    condo_key = _slug_archivo(condo_name)
+    if not condo_key:
+        raise ValueError("Escribe primero el nombre del edificio.")
+
+    conn = db()
+    try:
+        conn.execute(
+            """
+            INSERT INTO condo_images
+            (condo_key, condo_name, image_data, image_mime, updated_at)
+            VALUES (?, ?, ?, ?, NOW())
+            ON CONFLICT(condo_key) DO UPDATE SET
+                condo_name=EXCLUDED.condo_name,
+                image_data=EXCLUDED.image_data,
+                image_mime=EXCLUDED.image_mime,
+                updated_at=NOW()
+            """,
+            (condo_key, condo_name, psycopg2.Binary(image_bytes), mime)
+        )
+        conn.commit()
+    except Exception:
+        conn.rollback()
+        raise
+    finally:
+        conn.close()
+
+
+def delete_condo_image_if_unused(condo):
+    """Borra la foto solo cuando ya no quedan departamentos de ese edificio."""
+    condo_key = _slug_archivo(condo)
+    conn = db()
+    try:
+        remaining = conn.execute(
+            "SELECT COUNT(*) AS total FROM departments WHERE condo=?",
+            (condo,)
+        ).fetchone()["total"]
+        if int(remaining) == 0:
+            conn.execute("DELETE FROM condo_images WHERE condo_key=?", (condo_key,))
+            conn.commit()
+    finally:
+        conn.close()
+
+
 def _condo_image_data_uri(condo):
     """
-    Busca una foto para cada edificio/condominio.
-
-    Ejemplo: "Serena Pacífico" -> serena_pacifico.jpg
-    También acepta edificio_serena_pacifico.jpg.
-    Busca en la carpeta principal, assets y assets/edificios.
+    Busca primero la foto persistente del edificio en Supabase.
+    Si aún no existe, prueba archivos locales y finalmente portada.jpg.
     """
+    saved = _get_condo_image_row(condo)
+    if saved and saved["image_data"]:
+        try:
+            raw = bytes(saved["image_data"])
+            mime = saved["image_mime"] or "image/jpeg"
+            encoded = base64.b64encode(raw).decode("utf-8")
+            return f"data:{mime};base64,{encoded}"
+        except Exception:
+            pass
+
     base_dir = Path(__file__).resolve().parent
     slug = _slug_archivo(condo)
     carpetas = [base_dir, base_dir / "assets", base_dir / "assets" / "edificios"]
@@ -2631,26 +2737,94 @@ def page_departamentos():
     departments = get_departments()
 
     with st.expander("＋ Agregar departamento"):
-        st.caption("Puedes registrar todos los departamentos que necesites dentro del mismo edificio o condominio.")
-        condo = st.text_input("Edificio / condominio", placeholder="Ej. Serena Pacífico")
-        name = st.text_input("Nombre o número del departamento", placeholder="Ej. Depto 305")
-        capacity = st.number_input("Capacidad", min_value=1, value=4)
-        winter = st.number_input("Precio noche invierno", min_value=0, value=60000, step=5000)
-        summer = st.number_input("Precio noche verano", min_value=0, value=90000, step=5000)
+        st.caption(
+            "Registra el departamento y, si es un edificio nuevo, puedes subir su fotografía. "
+            "La foto queda guardada en Supabase y se reutiliza para todos sus departamentos."
+        )
 
-        if st.button("Agregar departamento", type="primary"):
-            if not condo.strip() or not name.strip():
+        condo = st.text_input(
+            "Edificio / condominio",
+            placeholder="Ej. Serena Pacífico",
+            key="new_department_condo"
+        )
+        name = st.text_input(
+            "Nombre o número del departamento",
+            placeholder="Ej. Depto 305",
+            key="new_department_name"
+        )
+
+        clean_condo = condo.strip()
+        existing_condo_names = {str(d["condo"]).strip() for d in departments}
+        same_existing = next(
+            (c for c in existing_condo_names if c.casefold() == clean_condo.casefold()),
+            None
+        ) if clean_condo else None
+
+        if same_existing:
+            if _condo_has_saved_image(same_existing):
+                st.success(
+                    f"{same_existing} ya tiene una fotografía guardada. "
+                    "Puedes dejar este campo vacío o subir otra para reemplazarla."
+                )
+            else:
+                st.info(
+                    f"{same_existing} ya existe, pero todavía no tiene una fotografía guardada. "
+                    "Puedes agregarla ahora."
+                )
+
+        building_photo = st.file_uploader(
+            "Foto del edificio (opcional)",
+            type=["jpg", "jpeg", "png", "webp"],
+            key="new_building_photo",
+            help="Máximo 5 MB. La misma foto se usará para todos los departamentos de este edificio."
+        )
+
+        if building_photo is not None:
+            st.image(building_photo, caption="Vista previa de la fotografía", use_container_width=True)
+
+        c1, c2, c3 = st.columns(3)
+        with c1:
+            capacity = st.number_input(
+                "Capacidad", min_value=1, value=4, key="new_department_capacity"
+            )
+        with c2:
+            winter = st.number_input(
+                "Precio noche invierno", min_value=0, value=60000, step=5000,
+                key="new_department_winter"
+            )
+        with c3:
+            summer = st.number_input(
+                "Precio noche verano", min_value=0, value=90000, step=5000,
+                key="new_department_summer"
+            )
+
+        if st.button("Agregar departamento", type="primary", use_container_width=True):
+            if not clean_condo or not name.strip():
                 st.warning("Completa el edificio/condominio y el departamento.")
             else:
-                insert_department(
-                    condo.strip(),
-                    name.strip(),
-                    capacity,
-                    winter,
-                    summer
-                )
-                st.success("Departamento agregado correctamente.")
-                st.rerun()
+                # Si el usuario escribió el mismo edificio con diferencias de mayúsculas,
+                # reutilizamos el nombre que ya existe para mantener todo agrupado.
+                final_condo = same_existing or clean_condo
+
+                try:
+                    # Si se subió una imagen, se guarda primero. Si el edificio ya tenía
+                    # una foto, esta operación la reemplaza.
+                    if building_photo is not None:
+                        save_condo_image(final_condo, building_photo)
+
+                    insert_department(
+                        final_condo,
+                        name.strip(),
+                        capacity,
+                        winter,
+                        summer
+                    )
+                    st.success("Departamento agregado correctamente.")
+                    st.rerun()
+                except ValueError as exc:
+                    st.error(str(exc))
+                except Exception as exc:
+                    st.error(f"No se pudo guardar el departamento: {exc}")
 
     if not departments:
         st.info("No hay departamentos registrados.")
@@ -2701,16 +2875,43 @@ def page_departamentos():
                     unsafe_allow_html=True
                 )
 
-            is_open = bool(st.session_state[state_key])
-            button_text = "▲ Ocultar departamentos" if is_open else "▼ Ver departamentos"
+            top_left, top_right = st.columns([3, 1])
+            with top_left:
+                is_open = bool(st.session_state[state_key])
+                button_text = "▲ Ocultar departamentos" if is_open else "▼ Ver departamentos"
+                if st.button(
+                    button_text,
+                    key=f"toggle_{slug}",
+                    use_container_width=True
+                ):
+                    st.session_state[state_key] = not is_open
+                    st.rerun()
 
-            if st.button(
-                button_text,
-                key=f"toggle_{slug}",
-                use_container_width=True
-            ):
-                st.session_state[state_key] = not is_open
-                st.rerun()
+            with top_right:
+                with st.popover("📷 Foto", use_container_width=True):
+                    st.caption("Cambia la fotografía del edificio. Se guardará permanentemente en Supabase.")
+                    replacement_photo = st.file_uploader(
+                        "Nueva fotografía",
+                        type=["jpg", "jpeg", "png", "webp"],
+                        key=f"replace_photo_{slug}",
+                        help="Máximo 5 MB."
+                    )
+                    if replacement_photo is not None:
+                        st.image(replacement_photo, caption="Vista previa", use_container_width=True)
+                        if st.button(
+                            "Guardar nueva foto",
+                            type="primary",
+                            key=f"save_photo_{slug}",
+                            use_container_width=True
+                        ):
+                            try:
+                                save_condo_image(condo, replacement_photo)
+                                st.success("Fotografía actualizada.")
+                                st.rerun()
+                            except ValueError as exc:
+                                st.error(str(exc))
+                            except Exception as exc:
+                                st.error(f"No se pudo guardar la fotografía: {exc}")
 
             if st.session_state[state_key]:
                 st.markdown('<div class="departments-inside"></div>', unsafe_allow_html=True)
@@ -2799,12 +3000,14 @@ def page_departamentos():
                                         "Elimina o gestiona primero esas reservas."
                                     )
                                 else:
+                                    old_condo = d["condo"]
                                     conn.execute(
                                         "DELETE FROM departments WHERE id=?",
                                         (d["id"],)
                                     )
                                     conn.commit()
                                     conn.close()
+                                    delete_condo_image_if_unused(old_condo)
                                     st.success("Departamento eliminado correctamente.")
                                     st.rerun()
 
