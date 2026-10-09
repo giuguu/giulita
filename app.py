@@ -5,6 +5,9 @@ from psycopg2.extras import DictCursor
 from psycopg2.pool import ThreadedConnectionPool
 import base64
 import unicodedata
+import json
+from io import BytesIO
+from html import escape as html_escape
 from datetime import date, datetime, timedelta
 from calendar import monthrange
 from pathlib import Path
@@ -1063,6 +1066,48 @@ def init_db():
     add_column_if_missing("checklist", "inspected", "INTEGER NOT NULL DEFAULT 0")
     add_column_if_missing("checklist", "keys", "INTEGER NOT NULL DEFAULT 0")
 
+
+    # Liquidaciones para propietarios: una por reserva y preferencias por departamento.
+    # Los importes de cada liquidación se guardan como fotografía histórica.
+    cur.execute("""
+        CREATE TABLE IF NOT EXISTS owner_liquidation_settings (
+            department_id BIGINT PRIMARY KEY REFERENCES departments(id) ON DELETE CASCADE,
+            owner_name TEXT NOT NULL DEFAULT '',
+            commission_percent SMALLINT NOT NULL DEFAULT 10
+                CHECK (commission_percent IN (10, 12)),
+            usual_costs JSONB NOT NULL DEFAULT '{}'::jsonb,
+            updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+        )
+    """)
+    cur.execute("""
+        CREATE TABLE IF NOT EXISTS owner_liquidations (
+            id BIGSERIAL PRIMARY KEY,
+            reservation_id BIGINT NOT NULL UNIQUE
+                REFERENCES reservations(id) ON DELETE CASCADE,
+            owner_name TEXT NOT NULL DEFAULT '',
+            condo_name TEXT NOT NULL DEFAULT '',
+            department_name TEXT NOT NULL DEFAULT '',
+            guest_name TEXT NOT NULL DEFAULT '',
+            check_in TEXT NOT NULL,
+            check_out TEXT NOT NULL,
+            nights INTEGER NOT NULL DEFAULT 0,
+            price_night BIGINT NOT NULL DEFAULT 0,
+            gross_total BIGINT NOT NULL DEFAULT 0,
+            commission_percent SMALLINT NOT NULL CHECK (commission_percent IN (10, 12)),
+            commission_amount BIGINT NOT NULL DEFAULT 0,
+            expenses JSONB NOT NULL DEFAULT '[]'::jsonb,
+            expenses_total BIGINT NOT NULL DEFAULT 0,
+            owner_net BIGINT NOT NULL DEFAULT 0,
+            notes TEXT NOT NULL DEFAULT '',
+            issued_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+            updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+        )
+    """)
+    # El acceso desde la aplicación es mediante la conexión privada a PostgreSQL;
+    # se impide que la Data API pública exponga estas tablas sin políticas.
+    cur.execute("ALTER TABLE owner_liquidation_settings ENABLE ROW LEVEL SECURITY")
+    cur.execute("ALTER TABLE owner_liquidations ENABLE ROW LEVEL SECURITY")
+
     count = cur.execute("SELECT COUNT(*) AS total FROM departments").fetchone()["total"]
     if count == 0:
         departments = [
@@ -1309,8 +1354,15 @@ def get_checklist(reservation_id):
 
 def set_page(page, reservation_id=None):
     st.session_state.page = page
+    if page in ("Inicio", "Reservas", "Calendario", "Departamentos", "Liquidaciones"):
+        # Los accesos directos desde Detalle no deben volver accidentalmente a Inicio.
+        st.session_state.nav_choice = page
     if reservation_id is not None:
         st.session_state.selected_reservation = reservation_id
+        if page == "Liquidaciones":
+            st.session_state.liquidation_selected_reservation = int(reservation_id)
+            st.session_state.liq_condo_filter = "Todos"
+            st.session_state.liq_select_reservation = int(reservation_id)
 
 
 def add_payment(reservation_id, amount, note):
@@ -1428,6 +1480,7 @@ pages = [
     "Reservas",
     "Calendario",
     "Departamentos",
+    "Liquidaciones",
 ]
 
 with st.sidebar:
@@ -2267,6 +2320,13 @@ def page_detalle():
             unsafe_allow_html=True
         )
 
+    st.button(
+        "Crear o consultar liquidación del propietario",
+        key=f"liquidation_shortcut_{rid}",
+        on_click=set_page,
+        args=("Liquidaciones", rid),
+    )
+
     st.markdown('<div class="section-title payment-section">💳 Pagos</div>', unsafe_allow_html=True)
 
     # Resumen personalizado para mantener el diseño rosado/fucsia.
@@ -3052,6 +3112,521 @@ def page_departamentos():
                                     st.rerun()
 
 
+
+# =========================================================
+# LIQUIDACIONES PARA PROPIETARIOS
+# =========================================================
+
+EXPENSE_PRESETS = (
+    ("aseo", "Aseo"),
+    ("sabanas", "Lavado de sábanas"),
+    ("ventanas", "Limpieza de ventanas"),
+)
+
+
+def format_clp(value):
+    """Moneda CLP correcta para montos negativos, sin decimales."""
+    value = int(value)
+    return ("-" if value < 0 else "") + money(abs(value))
+
+
+def calculate_owner_liquidation(gross_total, commission_percent, expenses):
+    """La comisión corresponde al bruto reservado, nunca al abono recibido."""
+    gross_total = int(gross_total)
+    commission_percent = int(commission_percent)
+    if gross_total < 0 or commission_percent not in (10, 12):
+        raise ValueError("Monto o porcentaje de comisión no permitido.")
+    commission = (gross_total * commission_percent + 50) // 100
+    expenses_total = 0
+    for item in expenses:
+        amount = int(item["amount"])
+        if amount < 0:
+            raise ValueError("Los gastos no pueden ser negativos.")
+        expenses_total += amount
+    return {
+        "gross_total": gross_total,
+        "commission_amount": commission,
+        "expenses_total": expenses_total,
+        "owner_net": gross_total - commission - expenses_total,
+    }
+
+
+def get_owner_liquidation_settings(department_id):
+    conn = db()
+    try:
+        row = conn.execute(
+            "SELECT * FROM owner_liquidation_settings WHERE department_id=?",
+            (department_id,)
+        ).fetchone()
+        return dict(row) if row else {
+            "owner_name": "", "commission_percent": 10, "usual_costs": {}
+        }
+    finally:
+        conn.close()
+
+
+def get_owner_liquidation(reservation_id):
+    conn = db()
+    try:
+        row = conn.execute(
+            "SELECT * FROM owner_liquidations WHERE reservation_id=?",
+            (reservation_id,)
+        ).fetchone()
+        return dict(row) if row else None
+    finally:
+        conn.close()
+
+
+def list_owner_liquidations():
+    conn = db()
+    try:
+        rows = conn.execute("""
+            SELECT * FROM owner_liquidations
+            ORDER BY updated_at DESC, id DESC
+        """).fetchall()
+        return [dict(r) for r in rows]
+    finally:
+        conn.close()
+
+
+def save_owner_liquidation(reservation, owner_name, commission_percent,
+                           expenses, notes, usual_costs):
+    """Guarda una liquidación por reserva y los gastos frecuentes por departamento.
+
+    Consulta nuevamente el total real de la reserva antes de guardar, para evitar
+    usar un total antiguo si la reserva fue editada en otra sesión.
+    """
+    rid = int(reservation["id"])
+    conn = db()
+    try:
+        cur = conn.cursor()
+        fresh = cur.execute("""
+            SELECT r.*, d.name AS dept_name, d.condo
+            FROM reservations r
+            JOIN departments d ON d.id=r.department_id
+            WHERE r.id=? FOR UPDATE OF r
+        """, (rid,)).fetchone()
+        if not fresh:
+            raise ValueError("La reserva fue eliminada. Actualiza la pantalla.")
+        if any(fresh[k] != reservation[k] for k in
+               ("total", "check_in", "check_out", "department_id")):
+            raise ValueError("La reserva cambió desde que abriste la liquidación. Recarga y revisa los montos.")
+        amounts = calculate_owner_liquidation(fresh["total"], commission_percent, expenses)
+        cur.execute("""
+            INSERT INTO owner_liquidations (
+                reservation_id, owner_name, condo_name, department_name, guest_name,
+                check_in, check_out, nights, price_night, gross_total,
+                commission_percent, commission_amount, expenses, expenses_total,
+                owner_net, notes, updated_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?::jsonb, ?, ?, ?, NOW())
+            ON CONFLICT (reservation_id) DO UPDATE SET
+                owner_name=EXCLUDED.owner_name,
+                condo_name=EXCLUDED.condo_name,
+                department_name=EXCLUDED.department_name,
+                guest_name=EXCLUDED.guest_name,
+                check_in=EXCLUDED.check_in,
+                check_out=EXCLUDED.check_out,
+                nights=EXCLUDED.nights,
+                price_night=EXCLUDED.price_night,
+                gross_total=EXCLUDED.gross_total,
+                commission_percent=EXCLUDED.commission_percent,
+                commission_amount=EXCLUDED.commission_amount,
+                expenses=EXCLUDED.expenses,
+                expenses_total=EXCLUDED.expenses_total,
+                owner_net=EXCLUDED.owner_net,
+                notes=EXCLUDED.notes,
+                updated_at=NOW()
+        """, (
+            rid, owner_name.strip(), fresh["condo"], fresh["dept_name"],
+            fresh["guest"], fresh["check_in"], fresh["check_out"],
+            int(fresh["nights"]), int(fresh["price_night"]),
+            amounts["gross_total"], int(commission_percent),
+            amounts["commission_amount"], json.dumps(expenses, ensure_ascii=False),
+            amounts["expenses_total"], amounts["owner_net"], notes.strip(),
+        ))
+        cur.execute("""
+            INSERT INTO owner_liquidation_settings
+                (department_id, owner_name, commission_percent, usual_costs, updated_at)
+            VALUES (?, ?, ?, ?::jsonb, NOW())
+            ON CONFLICT (department_id) DO UPDATE SET
+                owner_name=EXCLUDED.owner_name,
+                commission_percent=EXCLUDED.commission_percent,
+                usual_costs=EXCLUDED.usual_costs,
+                updated_at=NOW()
+        """, (
+            fresh["department_id"], owner_name.strip(), int(commission_percent),
+            json.dumps(usual_costs, ensure_ascii=False)
+        ))
+        conn.commit()
+    except Exception:
+        conn.rollback()
+        raise
+    finally:
+        conn.close()
+
+
+def owner_liquidation_pdf(statement):
+    """Genera el comprobante PDF desde datos previamente guardados."""
+    from reportlab.lib import colors
+    from reportlab.lib.enums import TA_LEFT, TA_RIGHT
+    from reportlab.lib.pagesizes import A4
+    from reportlab.lib.styles import ParagraphStyle
+    from reportlab.lib.units import mm
+    from reportlab.platypus import SimpleDocTemplate, Paragraph, Spacer, Table, TableStyle
+
+    buf = BytesIO()
+    doc = SimpleDocTemplate(
+        buf, pagesize=A4, leftMargin=19 * mm, rightMargin=19 * mm,
+        topMargin=20 * mm, bottomMargin=18 * mm,
+        title=f"Liquidación arriendo {statement['id']}",
+        author="Administración de arriendos",
+    )
+    dark = colors.HexColor("#26212A")
+    muted = colors.HexColor("#77717A")
+    accent = colors.HexColor("#B83272")
+    light = colors.HexColor("#FAF1F6")
+    white = colors.white
+    normal = ParagraphStyle("liq_normal", fontName="Helvetica", fontSize=9.5,
+                            leading=14, textColor=dark)
+    small = ParagraphStyle("liq_small", parent=normal, fontSize=8.5,
+                           leading=12, textColor=muted)
+    title_style = ParagraphStyle("liq_title", parent=normal, fontName="Helvetica-Bold",
+                                 fontSize=19, leading=24)
+    section = ParagraphStyle("liq_section", parent=normal, fontName="Helvetica-Bold",
+                             fontSize=10.5, spaceAfter=8)
+    right = ParagraphStyle("liq_right", parent=normal, alignment=TA_RIGHT)
+    row = ParagraphStyle("liq_row", parent=normal, fontSize=9, leading=13)
+    row_bold = ParagraphStyle("liq_row_bold", parent=row, fontName="Helvetica-Bold")
+    amount_style = ParagraphStyle("liq_amount", parent=row, alignment=TA_RIGHT)
+    amount_bold = ParagraphStyle("liq_amount_bold", parent=amount_style,
+                                 fontName="Helvetica-Bold")
+    esc = lambda s: html_escape(str(s or ""))
+
+    def pdf_date(raw):
+        try:
+            return date.fromisoformat(str(raw)[:10]).strftime("%d/%m/%Y")
+        except (ValueError, TypeError):
+            return str(raw)
+
+    dated = statement.get("issued_at")
+    if dated and hasattr(dated, "strftime"):
+        issued = dated.strftime("%d/%m/%Y")
+    else:
+        issued = pdf_date(dated or date.today().isoformat())
+
+    story = [
+        Paragraph("LIQUIDACIÓN DE ARRIENDO", title_style),
+        Spacer(1, 4 * mm),
+        Paragraph("Detalle de ingresos y descuentos para el propietario", small),
+        Spacer(1, 10 * mm),
+    ]
+    information = [
+        [Paragraph("<b>Comprobante</b>", normal),
+         Paragraph(f"LIQ-{int(statement['id']):06d}", right)],
+        [Paragraph("<b>Fecha de emisión</b>", normal), Paragraph(issued, right)],
+        [Paragraph("<b>Propietario</b>", normal),
+         Paragraph(esc(statement.get("owner_name") or "No informado"), right)],
+        [Paragraph("<b>Condominio</b>", normal),
+         Paragraph(esc(statement.get("condo_name")), right)],
+        [Paragraph("<b>Departamento</b>", normal),
+         Paragraph(esc(statement.get("department_name")), right)],
+        [Paragraph("<b>Huésped</b>", normal),
+         Paragraph(esc(statement.get("guest_name")), right)],
+        [Paragraph("<b>Entrada / salida</b>", normal),
+         Paragraph(f"{pdf_date(statement['check_in'])} - {pdf_date(statement['check_out'])}", right)],
+        [Paragraph("<b>Noches / valor por noche</b>", normal),
+         Paragraph(f"{int(statement['nights'])} / {format_clp(statement['price_night'])}", right)],
+    ]
+    info = Table(information, colWidths=[70 * mm, 102 * mm], hAlign="LEFT")
+    info.setStyle(TableStyle([
+        ("VALIGN", (0, 0), (-1, -1), "TOP"),
+        ("LINEBELOW", (0, -1), (-1, -1), .6, colors.HexColor("#E3D8DF")),
+        ("BOTTOMPADDING", (0, 0), (-1, -1), 7),
+        ("TOPPADDING", (0, 0), (-1, -1), 4),
+    ]))
+    story.extend([info, Spacer(1, 10 * mm), Paragraph("RESUMEN DE LA LIQUIDACIÓN", section)])
+    expenses = statement.get("expenses") or []
+    if isinstance(expenses, str):
+        expenses = json.loads(expenses)
+    lines = [
+        [Paragraph("CONCEPTO", row_bold), Paragraph("MONTO", amount_bold)],
+        [Paragraph("Total del arriendo", row),
+         Paragraph(format_clp(statement["gross_total"]), amount_style)],
+        [Paragraph(f"Comisión de administración ({int(statement['commission_percent'])}%)", row),
+         Paragraph("-" + format_clp(statement["commission_amount"]), amount_style)],
+    ]
+    for item in expenses:
+        lines.append([
+            Paragraph(esc(item.get("concept", "Gasto")), row),
+            Paragraph("-" + format_clp(item.get("amount", 0)), amount_style)
+        ])
+    if not expenses:
+        lines.append([Paragraph("Otros gastos: sin cargos", row), Paragraph("$0", amount_style)])
+    lines.append([
+        Paragraph("TOTAL A ENTREGAR AL PROPIETARIO", row_bold),
+        Paragraph(format_clp(statement["owner_net"]), amount_bold),
+    ])
+    tab = Table(lines, colWidths=[124 * mm, 48 * mm], hAlign="LEFT", repeatRows=1)
+    tab.setStyle(TableStyle([
+        ("BACKGROUND", (0, 0), (-1, 0), light),
+        ("TEXTCOLOR", (0, 0), (-1, 0), accent),
+        ("BACKGROUND", (0, -1), (-1, -1), light),
+        ("LINEABOVE", (0, -1), (-1, -1), 1, accent),
+        ("ALIGN", (1, 0), (1, -1), "RIGHT"),
+        ("VALIGN", (0, 0), (-1, -1), "MIDDLE"),
+        ("BOTTOMPADDING", (0, 0), (-1, -1), 8),
+        ("TOPPADDING", (0, 0), (-1, -1), 8),
+        ("LINEBELOW", (0, 1), (-1, -2), .35, colors.HexColor("#E8E2E5")),
+    ]))
+    story.append(tab)
+    if statement.get("notes", "").strip():
+        story.extend([
+            Spacer(1, 8 * mm), Paragraph("OBSERVACIONES", section),
+            Paragraph(esc(statement["notes"]).replace("\n", "<br/>"), normal)
+        ])
+    story.extend([
+        Spacer(1, 11 * mm),
+        Paragraph("Documento interno de liquidación. No constituye boleta ni factura tributaria.", small)
+    ])
+    def footer(canvas, document):
+        canvas.saveState()
+        canvas.setStrokeColor(colors.HexColor("#E4DCE1"))
+        canvas.line(19 * mm, 15 * mm, 191 * mm, 15 * mm)
+        canvas.setFont("Helvetica", 8)
+        canvas.setFillColor(muted)
+        canvas.drawString(19 * mm, 11 * mm, "Arriendos temporales · Liquidación para propietario")
+        canvas.drawRightString(191 * mm, 11 * mm, f"Página {document.page}")
+        canvas.restoreState()
+    doc.build(story, onFirstPage=footer, onLaterPages=footer)
+    return buf.getvalue()
+
+
+def page_liquidaciones():
+    page_section_header(
+        "Liquidaciones",
+        "Prepara el comprobante de ingresos, comisión y gastos de cada arriendo para su propietario."
+    )
+    st.caption("Los cálculos consideran el total del arriendo, no los pagos o abonos recibidos.")
+    tab_create, tab_saved = st.tabs(["Preparar liquidación", "Liquidaciones guardadas"])
+
+    reservations = list(get_reservations())
+    with tab_create:
+        if not reservations:
+            st.info("Registra una reserva para preparar la liquidación de su propietario.")
+        else:
+            condos = ["Todos"] + sorted({r["condo"] for r in reservations})
+            condo_filter = st.selectbox("Filtrar por condominio", condos, key="liq_condo_filter")
+            available = [r for r in reservations if condo_filter == "Todos" or r["condo"] == condo_filter]
+            options = {int(r["id"]): r for r in available}
+            ids = list(options)
+            wanted = st.session_state.get("liquidation_selected_reservation")
+            selected = st.selectbox(
+                "Seleccionar reserva",
+                ids,
+                index=ids.index(wanted) if wanted in ids else 0,
+                format_func=lambda rid: (
+                    f"{options[rid]['condo']} · {options[rid]['dept_name']} | "
+                    f"{options[rid]['guest']} | {options[rid]['check_in']} al {options[rid]['check_out']} "
+                    f"(N.º {rid})"
+                ),
+                key="liq_select_reservation",
+            )
+            r = options[selected]
+            rid = int(r["id"])
+            saved = get_owner_liquidation(rid)
+            settings = get_owner_liquidation_settings(r["department_id"])
+            costs = settings.get("usual_costs") or {}
+            if isinstance(costs, str):
+                costs = json.loads(costs)
+            version = st.session_state.get(f"liq_refresh_{rid}", 0)
+            prefix = f"owner_{rid}_v{version}"
+
+            st.markdown(f"**{r['condo']} · {r['dept_name']}**  |  {r['guest']}")
+            st.caption(
+                f"Entrada: {date.fromisoformat(r['check_in']):%d/%m/%Y} · "
+                f"Salida: {date.fromisoformat(r['check_out']):%d/%m/%Y} · "
+                f"{r['nights']} noches · Precio/noche: {money(r['price_night'])}"
+            )
+            if saved and (
+                int(saved["gross_total"]) != int(r["total"])
+                or saved["check_in"] != r["check_in"]
+                or saved["check_out"] != r["check_out"]
+                or saved["department_name"] != r["dept_name"]
+                or saved["condo_name"] != r["condo"]
+            ):
+                st.warning(
+                    "La reserva cambió después de guardar esta liquidación. "
+                    "Revisa los importes y presiona Guardar liquidación para actualizar el comprobante."
+                )
+
+            c_owner, c_pct = st.columns([3, 2])
+            with c_owner:
+                owner_name = st.text_input(
+                    "Nombre del propietario (opcional)",
+                    value=(saved["owner_name"] if saved else settings.get("owner_name", "")),
+                    key=f"{prefix}_owner",
+                )
+            with c_pct:
+                previous_pct = int(saved["commission_percent"] if saved else settings.get("commission_percent", 10))
+                commission_percent = st.radio(
+                    "Comisión sobre el total del arriendo",
+                    [10, 12], index=[10, 12].index(previous_pct),
+                    format_func=lambda p: f"{p}%", horizontal=True,
+                    key=f"{prefix}_commission",
+                )
+
+            saved_expenses = saved.get("expenses") or [] if saved else []
+            if isinstance(saved_expenses, str):
+                saved_expenses = json.loads(saved_expenses)
+            saved_standard = {x.get("code"): x for x in saved_expenses}
+            expenses = []
+            usual_costs = dict(costs)
+            st.markdown("#### Gastos del arriendo")
+            st.caption("Los valores habituales se recuerdan por departamento. Puedes activarlos, quitarlos o cambiar sus montos en cada arriendo.")
+            for code, concept in EXPENSE_PRESETS:
+                stored = saved_standard.get(code)
+                default_cost = int(stored["amount"]) if stored else int(costs.get(code, 0))
+                default_checked = bool(stored) if saved else bool(default_cost > 0 and code != "ventanas")
+                chk_col, amt_col = st.columns([2, 1])
+                with chk_col:
+                    enabled = st.checkbox(
+                        concept, value=default_checked, key=f"{prefix}_{code}_enabled"
+                    )
+                with amt_col:
+                    amount = st.number_input(
+                        f"Valor de {concept}", min_value=0, value=default_cost,
+                        step=1000, key=f"{prefix}_{code}_amount",
+                        label_visibility="collapsed",
+                    )
+                # Los importes usados quedan como referencia para el próximo arriendo.
+                if enabled and amount > 0:
+                    expenses.append({"code": code, "concept": concept, "amount": int(amount)})
+                    usual_costs[code] = int(amount)
+            existing_repair = saved_standard.get("reparaciones") if saved else None
+            with st.expander("Arreglos o reparaciones (si hubo)", expanded=bool(existing_repair)):
+                repairs_enabled = st.checkbox(
+                    "Incluir arreglos/reparaciones", value=bool(existing_repair),
+                    key=f"{prefix}_repairs_enabled"
+                )
+                rep_description = st.text_input(
+                    "Descripción del arreglo", value=(existing_repair or {}).get("description", ""),
+                    placeholder="Ej.: cambio de llave del baño", key=f"{prefix}_repair_description"
+                )
+                rep_amount = st.number_input(
+                    "Costo total del arreglo", min_value=0,
+                    value=int((existing_repair or {}).get("amount", 0)),
+                    step=1000, key=f"{prefix}_repair_amount"
+                )
+            if repairs_enabled and rep_amount > 0:
+                expenses.append({
+                    "code": "reparaciones",
+                    "concept": f"Arreglos/reparaciones: {rep_description.strip() or 'Sin detalle'}",
+                    "description": rep_description.strip(), "amount": int(rep_amount),
+                })
+            saved_custom = [x for x in saved_expenses if x.get("code") == "otro"]
+            with st.expander("Otros gastos (opcional)", expanded=bool(saved_custom)):
+                extra_count = st.number_input(
+                    "Cantidad de gastos adicionales", min_value=0, max_value=15,
+                    value=len(saved_custom), step=1, key=f"{prefix}_extra_count"
+                )
+                for idx in range(int(extra_count)):
+                    prior = saved_custom[idx] if idx < len(saved_custom) else {}
+                    ec1, ec2 = st.columns([2, 1])
+                    with ec1:
+                        extra_concept = st.text_input(
+                            f"Concepto #{idx+1}", value=prior.get("concept", ""),
+                            key=f"{prefix}_extra_name_{idx}"
+                        )
+                    with ec2:
+                        extra_amount = st.number_input(
+                            f"Monto #{idx+1}", min_value=0,
+                            value=int(prior.get("amount", 0)), step=1000,
+                            key=f"{prefix}_extra_amount_{idx}"
+                        )
+                    if extra_amount and extra_concept.strip():
+                        expenses.append({
+                            "code": "otro", "concept": extra_concept.strip(),
+                            "amount": int(extra_amount),
+                        })
+                    elif extra_amount and not extra_concept.strip():
+                        st.warning(f"Agrega una descripción para el gasto adicional #{idx+1}.")
+            notes = st.text_area(
+                "Observaciones para el propietario (opcional)",
+                value=saved["notes"] if saved else "",
+                key=f"{prefix}_notes"
+            )
+            amounts = calculate_owner_liquidation(r["total"], commission_percent, expenses)
+            st.markdown("#### Resumen calculado automáticamente")
+            a, b, c, d = st.columns(4)
+            a.metric("Total arriendo", format_clp(amounts["gross_total"]))
+            b.metric(f"Comisión ({commission_percent}%)", format_clp(amounts["commission_amount"]))
+            c.metric("Gastos", format_clp(amounts["expenses_total"]))
+            d.metric("Para el propietario", format_clp(amounts["owner_net"]))
+            st.caption(
+                f"Cálculo: {format_clp(amounts['gross_total'])} - "
+                f"{format_clp(amounts['commission_amount'])} - "
+                f"{format_clp(amounts['expenses_total'])} = "
+                f"{format_clp(amounts['owner_net'])}"
+            )
+            if amounts["owner_net"] < 0:
+                st.warning("Los descuentos superan el ingreso del arriendo. Revisa los gastos antes de guardar.")
+            if st.button(
+                "Guardar liquidación", type="primary", use_container_width=True,
+                key=f"{prefix}_save"
+            ):
+                try:
+                    save_owner_liquidation(r, owner_name, commission_percent, expenses, notes, usual_costs)
+                except Exception as exc:
+                    st.error(f"No fue posible guardar la liquidación: {exc}")
+                else:
+                    st.session_state[f"liq_refresh_{rid}"] = version + 1
+                    st.success("Liquidación guardada en Supabase. Ya puedes descargar su PDF.")
+                    st.rerun()
+
+            if saved:
+                st.divider()
+                st.markdown("**Comprobante guardado**")
+                st.caption("Este PDF contiene el último resumen guardado, no los cambios que aún no hayas guardado.")
+                st.download_button(
+                    "Descargar PDF de la liquidación",
+                    data=owner_liquidation_pdf(saved),
+                    file_name=f"liquidacion_{saved['id']:06d}_{_slug_archivo(saved['department_name'])}.pdf",
+                    mime="application/pdf", use_container_width=True,
+                    key=f"{prefix}_download"
+                )
+
+    with tab_saved:
+        statements = list_owner_liquidations()
+        if not statements:
+            st.info("Todavía no hay liquidaciones guardadas.")
+        else:
+            st.caption(f"{len(statements)} liquidación(es) guardada(s) y disponible(s) para reemitir.")
+            by_id = {int(x["id"]): x for x in statements}
+            chosen = st.selectbox(
+                "Seleccionar comprobante guardado", list(by_id),
+                format_func=lambda sid: (
+                    f"LIQ-{sid:06d} · {by_id[sid]['condo_name']} · "
+                    f"{by_id[sid]['department_name']} · {by_id[sid]['check_in']}"
+                ), key="liq_saved_select"
+            )
+            document = by_id[chosen]
+            st.write(
+                f"**Propietario:** {document['owner_name'] or 'No informado'} · "
+                f"**Huésped:** {document['guest_name']}"
+            )
+            c1, c2, c3 = st.columns(3)
+            c1.metric("Arriendo", format_clp(document["gross_total"]))
+            c2.metric("Descuentos", format_clp(int(document["commission_amount"]) + int(document["expenses_total"])))
+            c3.metric("Para el propietario", format_clp(document["owner_net"]))
+            st.download_button(
+                "Descargar comprobante PDF",
+                data=owner_liquidation_pdf(document),
+                file_name=f"liquidacion_{chosen:06d}_{_slug_archivo(document['department_name'])}.pdf",
+                mime="application/pdf", use_container_width=True,
+                key=f"liq_saved_download_{chosen}"
+            )
+
+
 # =========================================================
 # ROUTER
 # =========================================================
@@ -3067,6 +3642,9 @@ elif st.session_state.page == "Calendario":
 
 elif st.session_state.page == "Departamentos":
     page_departamentos()
+
+elif st.session_state.page == "Liquidaciones":
+    page_liquidaciones()
 
 elif st.session_state.page == "Detalle":
     page_detalle()
