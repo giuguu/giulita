@@ -161,6 +161,71 @@ st.markdown(
         line-height: 1.55;
     }}
 
+    /* Historial de liquidaciones: mismo lenguaje visual que Inicio. */
+    .liq-card-inner {
+        padding: 1px 1px 3px;
+        min-height: 166px;
+    }
+    .liq-card-tag {
+        display: inline-block;
+        color: {FUCHSIA_DARK};
+        background: {PINK_LIGHT};
+        border-radius: 999px;
+        padding: 5px 10px;
+        font-size: .72rem;
+        font-weight: 800;
+        letter-spacing: .035em;
+        text-transform: uppercase;
+    }
+    .liq-card-guest {
+        color: {TEXT};
+        font-size: 1.14rem;
+        font-weight: 800;
+        line-height: 1.35;
+        margin: 12px 0 5px;
+        overflow-wrap: anywhere;
+    }
+    .liq-card-department {
+        color: {FUCHSIA_DARK};
+        font-weight: 750;
+        font-size: .86rem;
+        margin-bottom: 8px;
+        overflow-wrap: anywhere;
+    }
+    .liq-card-meta {
+        color: {MUTED};
+        font-size: .84rem;
+        line-height: 1.75;
+        overflow-wrap: anywhere;
+    }
+    .liq-card-result {
+        margin: 13px 0 7px;
+        padding-top: 12px;
+        border-top: 1px solid {PINK_BORDER};
+        display: flex;
+        gap: 8px;
+        justify-content: space-between;
+        align-items: center;
+        flex-wrap: wrap;
+    }
+    .liq-card-result-label {
+        color: {MUTED};
+        font-size: .79rem;
+        font-weight: 650;
+    }
+    .liq-card-result-amount {
+        color: {FUCHSIA_DARK};
+        font-size: 1.2rem;
+        font-weight: 850;
+    }
+    /* Los contenedores guardan los botones dentro de la tarjeta. */
+    div[data-testid="stVerticalBlockBorderWrapper"]:has(.liq-card-inner) {
+        border-color: {PINK_BORDER} !important;
+        background: {WHITE} !important;
+        border-radius: 18px !important;
+        box-shadow: 0 5px 18px rgba(217,70,141,.06);
+    }
+
     .reminder {{
         background: {WHITE};
         border-left: 5px solid {FUCHSIA};
@@ -1362,7 +1427,9 @@ def set_page(page, reservation_id=None):
         if page == "Liquidaciones":
             st.session_state.liquidation_selected_reservation = int(reservation_id)
             st.session_state.liq_condo_filter = "Todos"
+            st.session_state.liq_department_filter = "Todos"
             st.session_state.liq_select_reservation = int(reservation_id)
+            st.session_state.liq_view = "Preparar liquidación"
 
 
 def add_payment(reservation_id, amount, note):
@@ -3265,6 +3332,7 @@ def save_owner_liquidation(reservation, owner_name, commission_percent,
         conn.close()
 
 
+@st.cache_data(show_spinner=False, max_entries=256)
 def owner_liquidation_pdf(statement):
     """Genera el comprobante PDF desde datos previamente guardados."""
     from reportlab.lib import colors
@@ -3401,230 +3469,350 @@ def owner_liquidation_pdf(statement):
     return buf.getvalue()
 
 
-def page_liquidaciones():
-    page_section_header(
-        "Liquidaciones",
-        "Prepara el comprobante de ingresos, comisión y gastos de cada arriendo para su propietario."
-    )
-    st.caption("Los cálculos consideran el total del arriendo, no los pagos o abonos recibidos.")
-    tab_create, tab_saved = st.tabs(["Preparar liquidación", "Liquidaciones guardadas"])
+def filter_owner_liquidations(statements, condo="Todos", department="Todos", search=""):
+    """Filtra comprobantes históricos por edificio, departamento y huésped/propietario."""
+    def normalize(value):
+        value = unicodedata.normalize("NFKD", str(value or ""))
+        return "".join(c for c in value if not unicodedata.combining(c)).casefold()
 
+    needle = normalize(search.strip())
+    result = []
+    for item in statements:
+        place = f"{item['condo_name']} · {item['department_name']}"
+        if condo != "Todos" and item["condo_name"] != condo:
+            continue
+        if department != "Todos" and place != department:
+            continue
+        if needle and needle not in normalize(
+            f"{item.get('guest_name', '')} {item.get('owner_name', '')} "
+            f"{place} {item.get('check_in', '')}"
+        ):
+            continue
+        result.append(item)
+    # Ver primero a quién llegó más recientemente, no el último documento editado.
+    return sorted(result, key=lambda x: (str(x["check_in"]), int(x["id"])), reverse=True)
+
+
+def page_historial_liquidaciones():
+    st.markdown('<div class="section-title">Liquidaciones guardadas</div>', unsafe_allow_html=True)
+    statements = list_owner_liquidations()
+    if not statements:
+        st.info("Todavía no hay liquidaciones guardadas. Puedes crear una en Preparar liquidación.")
+        return
+
+    condos = ["Todos"] + sorted({str(d["condo_name"]) for d in statements})
+    a, b, c = st.columns([1, 1, 1.35])
+    with a:
+        condo = st.selectbox("Condominio", condos, key="liq_history_condo")
+    departments = ["Todos"] + sorted({
+        f"{d['condo_name']} · {d['department_name']}"
+        for d in statements if condo == "Todos" or d["condo_name"] == condo
+    })
+    if st.session_state.get("liq_history_department", "Todos") not in departments:
+        st.session_state.liq_history_department = "Todos"
+    with b:
+        department = st.selectbox("Departamento", departments, key="liq_history_department")
+    with c:
+        search = st.text_input(
+            "Buscar huésped o propietario", key="liq_history_search",
+            placeholder="Escribe un nombre…"
+        )
+
+    visible = filter_owner_liquidations(statements, condo, department, search)
+    st.caption(f"Mostrando {len(visible)} de {len(statements)} liquidaciones, ordenadas por fecha de llegada.")
+    if not visible:
+        st.info("No hay liquidaciones que coincidan con los filtros.")
+        return
+
+    for i, document in enumerate(visible):
+        if i % 3 == 0:
+            columns = st.columns(3, gap="medium")
+        sid = int(document["id"])
+        guest = html_escape(str(document.get("guest_name") or "Sin nombre"))
+        condo_name = html_escape(str(document.get("condo_name") or ""))
+        dept_name = html_escape(str(document.get("department_name") or ""))
+        owner = html_escape(str(document.get("owner_name") or "Sin registrar"))
+        arrival = date.fromisoformat(str(document["check_in"])[:10]).strftime("%d/%m/%Y")
+        departure = date.fromisoformat(str(document["check_out"])[:10]).strftime("%d/%m/%Y")
+        with columns[i % 3]:
+            with st.container(border=True):
+                st.markdown(f"""
+                    <div class="liq-card-inner">
+                        <span class="liq-card-tag">Llegada · {arrival}</span>
+                        <div class="liq-card-guest">{guest}</div>
+                        <div class="liq-card-department">{dept_name} · {condo_name}</div>
+                        <div class="liq-card-meta">
+                            <strong>Salida:</strong> {departure}<br>
+                            <strong>Propietario:</strong> {owner}<br>
+                            <strong>Comprobante:</strong> LIQ-{sid:06d}
+                        </div>
+                        <div class="liq-card-result">
+                            <span class="liq-card-result-label">Para el propietario</span>
+                            <span class="liq-card-result-amount">{format_clp(document['owner_net'])}</span>
+                        </div>
+                    </div>
+                """, unsafe_allow_html=True)
+                action_pdf, action_edit = st.columns([1.2, 0.8], gap="small")
+                with action_pdf:
+                    try:
+                        pdf_bytes = owner_liquidation_pdf(document)
+                    except ImportError:
+                        st.caption("Falta ReportLab para descargar PDFs.")
+                    else:
+                        st.download_button(
+                            "Descargar PDF", data=pdf_bytes,
+                            file_name=f"liquidacion_{sid:06d}_{_slug_archivo(document['guest_name'])}.pdf",
+                            mime="application/pdf", key=f"liq_pdf_card_{sid}",
+                            use_container_width=True
+                        )
+                with action_edit:
+                    if st.button("Editar", key=f"liq_edit_card_{sid}", use_container_width=True):
+                        st.session_state.liquidation_selected_reservation = int(document["reservation_id"])
+                        st.session_state.liq_condo_filter = "Todos"
+                        st.session_state.liq_department_filter = "Todos"
+                        st.session_state.liq_select_reservation = int(document["reservation_id"])
+                        st.session_state.liq_view = "Preparar liquidación"
+                        st.rerun()
+
+
+def page_preparar_liquidacion():
+    st.markdown('<div class="section-title">Preparar liquidación</div>', unsafe_allow_html=True)
+    st.caption("El propietario y los precios habituales de aseo y lavado se recuerdan por departamento cuando guardas.")
     reservations = list(get_reservations())
-    with tab_create:
-        if not reservations:
-            st.info("Registra una reserva para preparar la liquidación de su propietario.")
-        else:
-            condos = ["Todos"] + sorted({r["condo"] for r in reservations})
-            condo_filter = st.selectbox("Filtrar por condominio", condos, key="liq_condo_filter")
-            available = [r for r in reservations if condo_filter == "Todos" or r["condo"] == condo_filter]
-            options = {int(r["id"]): r for r in available}
-            ids = list(options)
-            wanted = st.session_state.get("liquidation_selected_reservation")
-            selected = st.selectbox(
-                "Seleccionar reserva",
-                ids,
-                index=ids.index(wanted) if wanted in ids else 0,
-                format_func=lambda rid: (
-                    f"{options[rid]['condo']} · {options[rid]['dept_name']} | "
-                    f"{options[rid]['guest']} | {options[rid]['check_in']} al {options[rid]['check_out']} "
-                    f"(N.º {rid})"
-                ),
-                key="liq_select_reservation",
+    if not reservations:
+        st.info("Registra una reserva para preparar la liquidación de su propietario.")
+    else:
+        condos = ["Todos"] + sorted({r["condo"] for r in reservations})
+        condo_filter = st.selectbox("Filtrar por condominio", condos, key="liq_condo_filter")
+        available = [r for r in reservations if condo_filter == "Todos" or r["condo"] == condo_filter]
+        department_labels = ["Todos"] + sorted({
+            f"{r['condo']} · {r['dept_name']}" for r in available
+        })
+        # Al cambiar el condominio, un filtro de departamento anterior puede dejar
+        # de existir. Lo restablecemos antes de crear el widget.
+        if st.session_state.get("liq_department_filter", "Todos") not in department_labels:
+            st.session_state.liq_department_filter = "Todos"
+        dept_filter = st.selectbox(
+            "Filtrar por departamento", department_labels,
+            key="liq_department_filter"
+        )
+        if dept_filter != "Todos":
+            available = [r for r in available if f"{r['condo']} · {r['dept_name']}" == dept_filter]
+        options = {int(r["id"]): r for r in available}
+        ids = list(options)
+        wanted = st.session_state.get("liquidation_selected_reservation")
+        if not ids:
+            st.info("No hay reservas para los filtros seleccionados.")
+            return
+        if st.session_state.get("liq_select_reservation") not in ids:
+            st.session_state.liq_select_reservation = wanted if wanted in ids else ids[0]
+        selected = st.selectbox(
+            "Seleccionar reserva",
+            ids,
+            index=ids.index(wanted) if wanted in ids else 0,
+            format_func=lambda rid: (
+                f"{options[rid]['condo']} · {options[rid]['dept_name']} | "
+                f"{options[rid]['guest']} | {options[rid]['check_in']} al {options[rid]['check_out']} "
+                f"(N.º {rid})"
+            ),
+            key="liq_select_reservation",
+        )
+        r = options[selected]
+        rid = int(r["id"])
+        saved = get_owner_liquidation(rid)
+        settings = get_owner_liquidation_settings(r["department_id"])
+        costs = settings.get("usual_costs") or {}
+        if isinstance(costs, str):
+            costs = json.loads(costs)
+        version = st.session_state.get(f"liq_refresh_{rid}", 0)
+        prefix = f"owner_{rid}_v{version}"
+
+        st.markdown(f"**{r['condo']} · {r['dept_name']}**  |  {r['guest']}")
+        st.caption(
+            f"Entrada: {date.fromisoformat(r['check_in']):%d/%m/%Y} · "
+            f"Salida: {date.fromisoformat(r['check_out']):%d/%m/%Y} · "
+            f"{r['nights']} noches · Precio/noche: {money(r['price_night'])}"
+        )
+        if saved and (
+            int(saved["gross_total"]) != int(r["total"])
+            or saved["check_in"] != r["check_in"]
+            or saved["check_out"] != r["check_out"]
+            or saved["department_name"] != r["dept_name"]
+            or saved["condo_name"] != r["condo"]
+        ):
+            st.warning(
+                "La reserva cambió después de guardar esta liquidación. "
+                "Revisa los importes y presiona Guardar liquidación para actualizar el comprobante."
             )
-            r = options[selected]
-            rid = int(r["id"])
-            saved = get_owner_liquidation(rid)
-            settings = get_owner_liquidation_settings(r["department_id"])
-            costs = settings.get("usual_costs") or {}
-            if isinstance(costs, str):
-                costs = json.loads(costs)
-            version = st.session_state.get(f"liq_refresh_{rid}", 0)
-            prefix = f"owner_{rid}_v{version}"
 
-            st.markdown(f"**{r['condo']} · {r['dept_name']}**  |  {r['guest']}")
-            st.caption(
-                f"Entrada: {date.fromisoformat(r['check_in']):%d/%m/%Y} · "
-                f"Salida: {date.fromisoformat(r['check_out']):%d/%m/%Y} · "
-                f"{r['nights']} noches · Precio/noche: {money(r['price_night'])}"
+        c_owner, c_pct = st.columns([3, 2])
+        with c_owner:
+            owner_name = st.text_input(
+                "Nombre del propietario (opcional)",
+                value=((saved.get("owner_name") or settings.get("owner_name", "")) if saved else settings.get("owner_name", "")),
+                key=f"{prefix}_owner",
             )
-            if saved and (
-                int(saved["gross_total"]) != int(r["total"])
-                or saved["check_in"] != r["check_in"]
-                or saved["check_out"] != r["check_out"]
-                or saved["department_name"] != r["dept_name"]
-                or saved["condo_name"] != r["condo"]
-            ):
-                st.warning(
-                    "La reserva cambió después de guardar esta liquidación. "
-                    "Revisa los importes y presiona Guardar liquidación para actualizar el comprobante."
-                )
+        with c_pct:
+            previous_pct = int(saved["commission_percent"] if saved else settings.get("commission_percent", 10))
+            commission_percent = st.radio(
+                "Comisión sobre el total del arriendo",
+                [10, 12], index=[10, 12].index(previous_pct),
+                format_func=lambda p: f"{p}%", horizontal=True,
+                key=f"{prefix}_commission",
+            )
 
-            c_owner, c_pct = st.columns([3, 2])
-            with c_owner:
-                owner_name = st.text_input(
-                    "Nombre del propietario (opcional)",
-                    value=(saved["owner_name"] if saved else settings.get("owner_name", "")),
-                    key=f"{prefix}_owner",
+        saved_expenses = saved.get("expenses") or [] if saved else []
+        if isinstance(saved_expenses, str):
+            saved_expenses = json.loads(saved_expenses)
+        saved_standard = {x.get("code"): x for x in saved_expenses}
+        expenses = []
+        usual_costs = dict(costs)
+        st.markdown("#### Gastos del arriendo")
+        st.caption("Los valores habituales se recuerdan por departamento. Puedes activarlos, quitarlos o cambiar sus montos en cada arriendo.")
+        for code, concept in EXPENSE_PRESETS:
+            stored = saved_standard.get(code)
+            default_cost = int(stored["amount"]) if stored else int(costs.get(code, 0))
+            default_checked = bool(stored) if saved else bool(default_cost > 0 and code != "ventanas")
+            chk_col, amt_col = st.columns([2, 1])
+            with chk_col:
+                enabled = st.checkbox(
+                    concept, value=default_checked, key=f"{prefix}_{code}_enabled"
                 )
-            with c_pct:
-                previous_pct = int(saved["commission_percent"] if saved else settings.get("commission_percent", 10))
-                commission_percent = st.radio(
-                    "Comisión sobre el total del arriendo",
-                    [10, 12], index=[10, 12].index(previous_pct),
-                    format_func=lambda p: f"{p}%", horizontal=True,
-                    key=f"{prefix}_commission",
+            with amt_col:
+                amount = st.number_input(
+                    f"Valor de {concept}", min_value=0, value=default_cost,
+                    step=1000, key=f"{prefix}_{code}_amount",
+                    label_visibility="collapsed",
                 )
-
-            saved_expenses = saved.get("expenses") or [] if saved else []
-            if isinstance(saved_expenses, str):
-                saved_expenses = json.loads(saved_expenses)
-            saved_standard = {x.get("code"): x for x in saved_expenses}
-            expenses = []
-            usual_costs = dict(costs)
-            st.markdown("#### Gastos del arriendo")
-            st.caption("Los valores habituales se recuerdan por departamento. Puedes activarlos, quitarlos o cambiar sus montos en cada arriendo.")
-            for code, concept in EXPENSE_PRESETS:
-                stored = saved_standard.get(code)
-                default_cost = int(stored["amount"]) if stored else int(costs.get(code, 0))
-                default_checked = bool(stored) if saved else bool(default_cost > 0 and code != "ventanas")
-                chk_col, amt_col = st.columns([2, 1])
-                with chk_col:
-                    enabled = st.checkbox(
-                        concept, value=default_checked, key=f"{prefix}_{code}_enabled"
+            # Los importes usados quedan como referencia para el próximo arriendo.
+            if int(amount) > 0:
+                usual_costs[code] = int(amount)
+            if enabled and amount > 0:
+                expenses.append({"code": code, "concept": concept, "amount": int(amount)})
+        existing_repair = saved_standard.get("reparaciones") if saved else None
+        with st.expander("Arreglos o reparaciones (si hubo)", expanded=bool(existing_repair)):
+            repairs_enabled = st.checkbox(
+                "Incluir arreglos/reparaciones", value=bool(existing_repair),
+                key=f"{prefix}_repairs_enabled"
+            )
+            rep_description = st.text_input(
+                "Descripción del arreglo", value=(existing_repair or {}).get("description", ""),
+                placeholder="Ej.: cambio de llave del baño", key=f"{prefix}_repair_description"
+            )
+            rep_amount = st.number_input(
+                "Costo total del arreglo", min_value=0,
+                value=int((existing_repair or {}).get("amount", 0)),
+                step=1000, key=f"{prefix}_repair_amount"
+            )
+        if repairs_enabled and rep_amount > 0:
+            expenses.append({
+                "code": "reparaciones",
+                "concept": f"Arreglos/reparaciones: {rep_description.strip() or 'Sin detalle'}",
+                "description": rep_description.strip(), "amount": int(rep_amount),
+            })
+        saved_custom = [x for x in saved_expenses if x.get("code") == "otro"]
+        with st.expander("Otros gastos (opcional)", expanded=bool(saved_custom)):
+            extra_count = st.number_input(
+                "Cantidad de gastos adicionales", min_value=0, max_value=15,
+                value=len(saved_custom), step=1, key=f"{prefix}_extra_count"
+            )
+            for idx in range(int(extra_count)):
+                prior = saved_custom[idx] if idx < len(saved_custom) else {}
+                ec1, ec2 = st.columns([2, 1])
+                with ec1:
+                    extra_concept = st.text_input(
+                        f"Concepto #{idx+1}", value=prior.get("concept", ""),
+                        key=f"{prefix}_extra_name_{idx}"
                     )
-                with amt_col:
-                    amount = st.number_input(
-                        f"Valor de {concept}", min_value=0, value=default_cost,
-                        step=1000, key=f"{prefix}_{code}_amount",
-                        label_visibility="collapsed",
+                with ec2:
+                    extra_amount = st.number_input(
+                        f"Monto #{idx+1}", min_value=0,
+                        value=int(prior.get("amount", 0)), step=1000,
+                        key=f"{prefix}_extra_amount_{idx}"
                     )
-                # Los importes usados quedan como referencia para el próximo arriendo.
-                if enabled and amount > 0:
-                    expenses.append({"code": code, "concept": concept, "amount": int(amount)})
-                    usual_costs[code] = int(amount)
-            existing_repair = saved_standard.get("reparaciones") if saved else None
-            with st.expander("Arreglos o reparaciones (si hubo)", expanded=bool(existing_repair)):
-                repairs_enabled = st.checkbox(
-                    "Incluir arreglos/reparaciones", value=bool(existing_repair),
-                    key=f"{prefix}_repairs_enabled"
+                if extra_amount and extra_concept.strip():
+                    expenses.append({
+                        "code": "otro", "concept": extra_concept.strip(),
+                        "amount": int(extra_amount),
+                    })
+                elif extra_amount and not extra_concept.strip():
+                    st.warning(f"Agrega una descripción para el gasto adicional #{idx+1}.")
+        notes = st.text_area(
+            "Observaciones para el propietario (opcional)",
+            value=saved["notes"] if saved else "",
+            key=f"{prefix}_notes"
+        )
+        amounts = calculate_owner_liquidation(r["total"], commission_percent, expenses)
+        st.markdown("#### Resumen calculado automáticamente")
+        summary_data = [
+            ("TOTAL ARRIENDO", amounts["gross_total"]),
+            (f"COMISIÓN ({commission_percent}%)", amounts["commission_amount"]),
+            ("GASTOS", amounts["expenses_total"]),
+            ("PARA EL PROPIETARIO", amounts["owner_net"]),
+        ]
+        for col, (label, amount) in zip(st.columns(4), summary_data):
+            with col:
+                st.markdown(
+                    f'<div class="metric-card"><div class="metric-label">{label}</div>'
+                    f'<div class="metric-value">{format_clp(amount)}</div></div>',
+                    unsafe_allow_html=True
                 )
-                rep_description = st.text_input(
-                    "Descripción del arreglo", value=(existing_repair or {}).get("description", ""),
-                    placeholder="Ej.: cambio de llave del baño", key=f"{prefix}_repair_description"
-                )
-                rep_amount = st.number_input(
-                    "Costo total del arreglo", min_value=0,
-                    value=int((existing_repair or {}).get("amount", 0)),
-                    step=1000, key=f"{prefix}_repair_amount"
-                )
-            if repairs_enabled and rep_amount > 0:
-                expenses.append({
-                    "code": "reparaciones",
-                    "concept": f"Arreglos/reparaciones: {rep_description.strip() or 'Sin detalle'}",
-                    "description": rep_description.strip(), "amount": int(rep_amount),
-                })
-            saved_custom = [x for x in saved_expenses if x.get("code") == "otro"]
-            with st.expander("Otros gastos (opcional)", expanded=bool(saved_custom)):
-                extra_count = st.number_input(
-                    "Cantidad de gastos adicionales", min_value=0, max_value=15,
-                    value=len(saved_custom), step=1, key=f"{prefix}_extra_count"
-                )
-                for idx in range(int(extra_count)):
-                    prior = saved_custom[idx] if idx < len(saved_custom) else {}
-                    ec1, ec2 = st.columns([2, 1])
-                    with ec1:
-                        extra_concept = st.text_input(
-                            f"Concepto #{idx+1}", value=prior.get("concept", ""),
-                            key=f"{prefix}_extra_name_{idx}"
-                        )
-                    with ec2:
-                        extra_amount = st.number_input(
-                            f"Monto #{idx+1}", min_value=0,
-                            value=int(prior.get("amount", 0)), step=1000,
-                            key=f"{prefix}_extra_amount_{idx}"
-                        )
-                    if extra_amount and extra_concept.strip():
-                        expenses.append({
-                            "code": "otro", "concept": extra_concept.strip(),
-                            "amount": int(extra_amount),
-                        })
-                    elif extra_amount and not extra_concept.strip():
-                        st.warning(f"Agrega una descripción para el gasto adicional #{idx+1}.")
-            notes = st.text_area(
-                "Observaciones para el propietario (opcional)",
-                value=saved["notes"] if saved else "",
-                key=f"{prefix}_notes"
-            )
-            amounts = calculate_owner_liquidation(r["total"], commission_percent, expenses)
-            st.markdown("#### Resumen calculado automáticamente")
-            a, b, c, d = st.columns(4)
-            a.metric("Total arriendo", format_clp(amounts["gross_total"]))
-            b.metric(f"Comisión ({commission_percent}%)", format_clp(amounts["commission_amount"]))
-            c.metric("Gastos", format_clp(amounts["expenses_total"]))
-            d.metric("Para el propietario", format_clp(amounts["owner_net"]))
-            st.caption(
-                f"Cálculo: {format_clp(amounts['gross_total'])} - "
-                f"{format_clp(amounts['commission_amount'])} - "
-                f"{format_clp(amounts['expenses_total'])} = "
-                f"{format_clp(amounts['owner_net'])}"
-            )
-            if amounts["owner_net"] < 0:
-                st.warning("Los descuentos superan el ingreso del arriendo. Revisa los gastos antes de guardar.")
-            if st.button(
-                "Guardar liquidación", type="primary", use_container_width=True,
-                key=f"{prefix}_save"
-            ):
-                try:
-                    save_owner_liquidation(r, owner_name, commission_percent, expenses, notes, usual_costs)
-                except Exception as exc:
-                    st.error(f"No fue posible guardar la liquidación: {exc}")
-                else:
-                    st.session_state[f"liq_refresh_{rid}"] = version + 1
-                    st.success("Liquidación guardada en Supabase. Ya puedes descargar su PDF.")
-                    st.rerun()
+        st.caption(
+            f"Cálculo: {format_clp(amounts['gross_total'])} - "
+            f"{format_clp(amounts['commission_amount'])} - "
+            f"{format_clp(amounts['expenses_total'])} = "
+            f"{format_clp(amounts['owner_net'])}"
+        )
+        if amounts["owner_net"] < 0:
+            st.warning("Los descuentos superan el ingreso del arriendo. Revisa los gastos antes de guardar.")
+        if st.button(
+            "Guardar liquidación", type="primary", use_container_width=True,
+            key=f"{prefix}_save"
+        ):
+            try:
+                save_owner_liquidation(r, owner_name, commission_percent, expenses, notes, usual_costs)
+            except Exception as exc:
+                st.error(f"No fue posible guardar la liquidación: {exc}")
+            else:
+                st.session_state[f"liq_refresh_{rid}"] = version + 1
+                st.success("Liquidación guardada en Supabase. Ya puedes descargar su PDF.")
+                st.rerun()
 
-            if saved:
-                st.divider()
-                st.markdown("**Comprobante guardado**")
-                st.caption("Este PDF contiene el último resumen guardado, no los cambios que aún no hayas guardado.")
+        if saved:
+            st.divider()
+            st.markdown("**Comprobante guardado**")
+            st.caption("Este PDF contiene el último resumen guardado, no los cambios que aún no hayas guardado.")
+            try:
+                saved_pdf = owner_liquidation_pdf(saved)
+            except ImportError:
+                st.warning("No se puede generar el PDF. Agrega reportlab>=4.2,<5 en requirements.txt y vuelve a desplegar.")
+            else:
                 st.download_button(
                     "Descargar PDF de la liquidación",
-                    data=owner_liquidation_pdf(saved),
-                    file_name=f"liquidacion_{saved['id']:06d}_{_slug_archivo(saved['department_name'])}.pdf",
+                    data=saved_pdf,
+                    file_name=f"liquidacion_{int(saved['id']):06d}_{_slug_archivo(saved['department_name'])}.pdf",
                     mime="application/pdf", use_container_width=True,
                     key=f"{prefix}_download"
                 )
 
-    with tab_saved:
-        statements = list_owner_liquidations()
-        if not statements:
-            st.info("Todavía no hay liquidaciones guardadas.")
-        else:
-            st.caption(f"{len(statements)} liquidación(es) guardada(s) y disponible(s) para reemitir.")
-            by_id = {int(x["id"]): x for x in statements}
-            chosen = st.selectbox(
-                "Seleccionar comprobante guardado", list(by_id),
-                format_func=lambda sid: (
-                    f"LIQ-{sid:06d} · {by_id[sid]['condo_name']} · "
-                    f"{by_id[sid]['department_name']} · {by_id[sid]['check_in']}"
-                ), key="liq_saved_select"
-            )
-            document = by_id[chosen]
-            st.write(
-                f"**Propietario:** {document['owner_name'] or 'No informado'} · "
-                f"**Huésped:** {document['guest_name']}"
-            )
-            c1, c2, c3 = st.columns(3)
-            c1.metric("Arriendo", format_clp(document["gross_total"]))
-            c2.metric("Descuentos", format_clp(int(document["commission_amount"]) + int(document["expenses_total"])))
-            c3.metric("Para el propietario", format_clp(document["owner_net"]))
-            st.download_button(
-                "Descargar comprobante PDF",
-                data=owner_liquidation_pdf(document),
-                file_name=f"liquidacion_{chosen:06d}_{_slug_archivo(document['department_name'])}.pdf",
-                mime="application/pdf", use_container_width=True,
-                key=f"liq_saved_download_{chosen}"
-            )
+
+def page_liquidaciones():
+    # Usa la misma portada y paleta que la pantalla Inicio.
+    page_section_header(
+        "Liquidaciones",
+        "Consulta tus liquidaciones por huésped, llegada y departamento, o prepara el comprobante para cada propietario."
+    )
+    st.caption("La comisión se calcula sobre el total del arriendo, no sobre los abonos.")
+    if "liq_view" not in st.session_state:
+        st.session_state.liq_view = "Historial"
+    view = st.segmented_control(
+        "Vista de liquidaciones", ["Historial", "Preparar liquidación"],
+        key="liq_view", label_visibility="collapsed"
+    )
+    if view == "Preparar liquidación":
+        page_preparar_liquidacion()
+    else:
+        page_historial_liquidaciones()
 
 
 # =========================================================
