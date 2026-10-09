@@ -162,11 +162,11 @@ st.markdown(
     }}
 
     /* Historial de liquidaciones: mismo lenguaje visual que Inicio. */
-    .liq-card-inner {
+    .liq-card-inner {{
         padding: 1px 1px 3px;
         min-height: 166px;
-    }
-    .liq-card-tag {
+    }}
+    .liq-card-tag {{
         display: inline-block;
         color: {FUCHSIA_DARK};
         background: {PINK_LIGHT};
@@ -176,29 +176,29 @@ st.markdown(
         font-weight: 800;
         letter-spacing: .035em;
         text-transform: uppercase;
-    }
-    .liq-card-guest {
+    }}
+    .liq-card-guest {{
         color: {TEXT};
         font-size: 1.14rem;
         font-weight: 800;
         line-height: 1.35;
         margin: 12px 0 5px;
         overflow-wrap: anywhere;
-    }
-    .liq-card-department {
+    }}
+    .liq-card-department {{
         color: {FUCHSIA_DARK};
         font-weight: 750;
         font-size: .86rem;
         margin-bottom: 8px;
         overflow-wrap: anywhere;
-    }
-    .liq-card-meta {
+    }}
+    .liq-card-meta {{
         color: {MUTED};
         font-size: .84rem;
         line-height: 1.75;
         overflow-wrap: anywhere;
-    }
-    .liq-card-result {
+    }}
+    .liq-card-result {{
         margin: 13px 0 7px;
         padding-top: 12px;
         border-top: 1px solid {PINK_BORDER};
@@ -207,24 +207,24 @@ st.markdown(
         justify-content: space-between;
         align-items: center;
         flex-wrap: wrap;
-    }
-    .liq-card-result-label {
+    }}
+    .liq-card-result-label {{
         color: {MUTED};
         font-size: .79rem;
         font-weight: 650;
-    }
-    .liq-card-result-amount {
+    }}
+    .liq-card-result-amount {{
         color: {FUCHSIA_DARK};
         font-size: 1.2rem;
         font-weight: 850;
-    }
+    }}
     /* Los contenedores guardan los botones dentro de la tarjeta. */
-    div[data-testid="stVerticalBlockBorderWrapper"]:has(.liq-card-inner) {
+    div[data-testid="stVerticalBlockBorderWrapper"]:has(.liq-card-inner) {{
         border-color: {PINK_BORDER} !important;
         background: {WHITE} !important;
         border-radius: 18px !important;
         box-shadow: 0 5px 18px rgba(217,70,141,.06);
-    }
+    }}
 
     .reminder {{
         background: {WHITE};
