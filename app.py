@@ -11,6 +11,9 @@ from html import escape as html_escape
 from datetime import date, datetime, timedelta
 from calendar import monthrange
 from pathlib import Path
+from psycopg2 import errors as pg_errors
+import acceso
+import activacion
 
 # =========================================================
 # CONFIGURACIÓN
@@ -471,16 +474,27 @@ st.markdown(
         background: {PINK_LIGHT};
     }}
 
-    div.stButton > button[kind="primary"] {{
-        background: {FUCHSIA};
-        border-color: {FUCHSIA};
-        color: white;
+    div.stButton > button[kind="primary"],
+    [data-testid="stFormSubmitButton"] button[kind="primaryFormSubmit"],
+    [data-testid="stFormSubmitButton"] button[kind="primary"] {{
+        background: {FUCHSIA_DARK} !important;
+        border-color: {FUCHSIA_DARK} !important;
+        color: #FFFFFF !important;
     }}
 
-    div.stButton > button[kind="primary"]:hover {{
-        background: {FUCHSIA_DARK};
-        border-color: {FUCHSIA_DARK};
-        color: white;
+    div.stButton > button[kind="primary"]:hover,
+    [data-testid="stFormSubmitButton"] button[kind="primaryFormSubmit"]:hover,
+    [data-testid="stFormSubmitButton"] button[kind="primary"]:hover {{
+        background: #9C255F !important;
+        border-color: #9C255F !important;
+        color: #FFFFFF !important;
+    }}
+
+    div.stButton > button[kind="primary"] *,
+    [data-testid="stFormSubmitButton"] button[kind="primaryFormSubmit"] *,
+    [data-testid="stFormSubmitButton"] button[kind="primary"] * {{
+        color: #FFFFFF !important;
+        -webkit-text-fill-color: #FFFFFF !important;
     }}
 
     /* =========================
@@ -848,6 +862,263 @@ st.markdown(
 )
 
 # =========================================================
+# DISEÑO DEL LOGIN (pantalla dividida, foto personalizable)
+# =========================================================
+
+LOGIN_CSS = """
+<style>
+/* Pantallas públicas: colores suaves, texto legible y botones rosados. */
+[data-testid="stSidebar"] { display: none !important; }
+[data-testid="stHeader"] { background: transparent !important; }
+[data-testid="stDecoration"] { display: none !important; }
+.stApp {
+    background:
+      radial-gradient(ellipse at 7% 10%, rgba(250, 196, 224, .33), transparent 37%),
+      radial-gradient(ellipse at 94% 90%, rgba(213, 204, 245, .30), transparent 40%),
+      linear-gradient(135deg, #fffafd 0%, #fbedf5 52%, #f3edf9 100%) !important;
+    color: #3c2d3d !important;
+    min-height: 100vh;
+}
+[data-testid="stMainBlockContainer"] {
+    max-width: 1120px !important;
+    padding-top: clamp(1.4rem, 4vh, 3.4rem) !important;
+    padding-bottom: 3.5rem !important;
+}
+.auth-overline {
+    text-align: center;
+    font-size: .77rem;
+    font-weight: 800;
+    letter-spacing: .21em;
+    color: #85516f !important;
+    text-transform: uppercase;
+    margin: 0 0 1.5rem;
+}
+/* Las dos tarjetas forman una sola experiencia en cada etapa. */
+[data-testid="stVerticalBlockBorderWrapper"]:has(.auth-visual-anchor),
+[data-testid="stVerticalBlockBorderWrapper"]:has(.auth-form-anchor),
+[data-testid="stVerticalBlockBorderWrapper"]:has(.auth-welcome-anchor) {
+    border: 1px solid #f1dbe8 !important;
+    border-radius: 28px !important;
+    background: #fff !important;
+    box-shadow: 0 15px 46px rgba(96, 43, 86, .08), 0 2px 9px rgba(96, 43, 86, .04);
+    overflow: hidden;
+    min-height: 575px;
+}
+[data-testid="stVerticalBlockBorderWrapper"]:has(.auth-visual-anchor) > div,
+[data-testid="stVerticalBlockBorderWrapper"]:has(.auth-form-anchor) > div,
+[data-testid="stVerticalBlockBorderWrapper"]:has(.auth-welcome-anchor) > div {
+    padding: .85rem 1.15rem 1.35rem;
+}
+.auth-visual-anchor, .auth-form-anchor, .auth-welcome-anchor { height: 0; font-size: 0; }
+[data-testid="stVerticalBlockBorderWrapper"]:has(.auth-visual-anchor) [data-testid="stImage"] img {
+    width: 100%;
+    height: clamp(255px, 37vh, 340px);
+    object-fit: cover;
+    object-position: center;
+    border-radius: 18px;
+}
+.auth-visual-fallback {
+    height: clamp(255px, 37vh, 340px);
+    border-radius: 18px;
+    background: linear-gradient(160deg, #ffe3ee 0%, #f6c2db 55%, #fbe6f1 100%);
+    overflow: hidden;
+}
+.auth-visual-fallback svg { display: block; width: 100%; height: 100%; }
+.auth-welcome {
+    color: #b83272 !important;
+    text-align: center;
+    font-weight: 850;
+    font-size: clamp(1.85rem, 3.3vw, 2.5rem);
+    letter-spacing: -.04em;
+    margin: .55rem 0 .2rem;
+}
+.auth-welcome-text {
+    color: #665263 !important;
+    font-size: .95rem;
+    text-align: center;
+    line-height: 1.6;
+    max-width: 350px;
+    margin: .2rem auto 1.2rem;
+}
+.auth-mini-divider {
+    height: 3px;
+    width: 52px;
+    background: #edc0d7;
+    border-radius: 999px;
+    margin: 0 auto;
+}
+/* Bienvenida: no se muestran campos de acceso. */
+.auth-welcome-kicker {
+    color: #9c2d6a !important;
+    font-size: .75rem;
+    letter-spacing: .13em;
+    font-weight: 850;
+    margin: 2.45rem 0 1.2rem;
+    text-transform: uppercase;
+}
+.auth-welcome-headline {
+    font-size: clamp(2rem, 3.4vw, 3rem);
+    font-weight: 850;
+    line-height: 1.15;
+    letter-spacing: -.045em;
+    color: #482b44 !important;
+    margin: 0 0 1.15rem;
+}
+.auth-welcome-description {
+    font-size: 1.02rem;
+    line-height: 1.7;
+    color: #624e60 !important;
+    margin: 0 0 1.55rem;
+}
+.auth-welcome-features {
+    color: #624e60 !important;
+    font-size: .94rem;
+    line-height: 1.8;
+    background: #fff7fb;
+    border: 1px solid #f7dce9;
+    border-radius: 16px;
+    padding: 15px 18px;
+    margin: 0 0 1.45rem;
+}
+.auth-welcome-features strong { color: #5a3551 !important; }
+.auth-access-note {
+    text-align: center;
+    color: #715b6d !important;
+    font-size: .82rem;
+    margin-top: .85rem;
+}
+/* Encabezado con globos, solo en el formulario. */
+.auth-header-art {
+    height: 155px;
+    margin: -.85rem -1.15rem .9rem;
+    overflow: hidden;
+    border-radius: 18px 18px 26% 26% / 18px 18px 11% 11%;
+    background: #f8dce9;
+}
+.auth-header-art svg { width: 100%; height: 100%; display: block; }
+.auth-form-kicker {
+    font-size: .74rem;
+    font-weight: 850;
+    letter-spacing: .15em;
+    color: #984067 !important;
+    text-align: center;
+    margin-top: .15rem;
+}
+.auth-form-heading {
+    font-size: clamp(1.8rem, 3vw, 2.3rem);
+    font-weight: 850;
+    letter-spacing: -.04em;
+    line-height: 1.2;
+    color: #482b44 !important;
+    text-align: center;
+    margin: .35rem 0 .4rem;
+}
+.auth-form-subtitle {
+    color: #665263 !important;
+    font-size: .92rem;
+    line-height: 1.5;
+    text-align: center;
+    margin-bottom: .85rem;
+}
+/* Inputs y etiquetas: forzamos contraste independientemente del tema de Streamlit. */
+[data-testid="stVerticalBlockBorderWrapper"]:has(.auth-form-anchor) [data-testid="stForm"] {
+    border: 0 !important;
+    padding: 0 !important;
+    margin: 0 !important;
+}
+[data-testid="stVerticalBlockBorderWrapper"]:has(.auth-form-anchor) [data-testid="stWidgetLabel"] *,
+[data-testid="stVerticalBlockBorderWrapper"]:has(.auth-form-anchor) label,
+[data-testid="stVerticalBlockBorderWrapper"]:has(.auth-form-anchor) [data-testid="stExpander"] summary {
+    color: #482b44 !important;
+    opacity: 1 !important;
+    font-weight: 700;
+}
+[data-testid="stVerticalBlockBorderWrapper"]:has(.auth-form-anchor) [data-testid="stTextInput"] input {
+    background: #fffafe !important;
+    color: #36283a !important;
+    -webkit-text-fill-color: #36283a !important;
+    border: 1px solid #e9bfd5 !important;
+    border-radius: 12px !important;
+    min-height: 44px;
+    padding-left: .85rem !important;
+    color-scheme: light !important;
+}
+[data-testid="stVerticalBlockBorderWrapper"]:has(.auth-form-anchor) [data-testid="stTextInput"] input::placeholder {
+    color: #786574 !important;
+    -webkit-text-fill-color: #786574 !important;
+    opacity: 1 !important;
+}
+[data-testid="stVerticalBlockBorderWrapper"]:has(.auth-form-anchor) [data-testid="stTextInput"] input:focus {
+    border-color: #b83272 !important;
+    box-shadow: 0 0 0 3px rgba(184,50,114,.13) !important;
+}
+/* Empezar, iniciar sesión, recuperar contraseña: todos rosados, nunca naranja. */
+[data-testid="stVerticalBlockBorderWrapper"]:has(.auth-welcome-anchor) [data-testid="stButton"] button[kind="primary"],
+[data-testid="stVerticalBlockBorderWrapper"]:has(.auth-form-anchor) [data-testid="stFormSubmitButton"] button,
+[data-testid="stVerticalBlockBorderWrapper"]:has(.auth-form-anchor) button[kind="primaryFormSubmit"] {
+    background: #b83272 !important;
+    border: 1px solid #b83272 !important;
+    border-radius: 999px !important;
+    min-height: 3rem !important;
+    box-shadow: 0 7px 18px rgba(184,50,114,.12);
+}
+[data-testid="stVerticalBlockBorderWrapper"]:has(.auth-welcome-anchor) [data-testid="stButton"] button[kind="primary"]:hover,
+[data-testid="stVerticalBlockBorderWrapper"]:has(.auth-form-anchor) [data-testid="stFormSubmitButton"] button:hover,
+[data-testid="stVerticalBlockBorderWrapper"]:has(.auth-form-anchor) button[kind="primaryFormSubmit"]:hover {
+    background: #99275c !important;
+    border-color: #99275c !important;
+}
+[data-testid="stVerticalBlockBorderWrapper"]:has(.auth-welcome-anchor) [data-testid="stButton"] button[kind="primary"] *,
+[data-testid="stVerticalBlockBorderWrapper"]:has(.auth-form-anchor) [data-testid="stFormSubmitButton"] button *,
+[data-testid="stVerticalBlockBorderWrapper"]:has(.auth-form-anchor) button[kind="primaryFormSubmit"] * {
+    color: #fff !important;
+    -webkit-text-fill-color: #fff !important;
+    font-weight: 800 !important;
+}
+[data-testid="stVerticalBlockBorderWrapper"]:has(.auth-form-anchor) [data-testid="stButton"] button[kind="secondary"] {
+    background: #fff3fa !important;
+    border-color: #f0d4e1 !important;
+    color: #8b2456 !important;
+    border-radius: 999px !important;
+}
+[data-testid="stVerticalBlockBorderWrapper"]:has(.auth-form-anchor) [data-testid="stButton"] button[kind="secondary"] * {
+    color: #8b2456 !important;
+    -webkit-text-fill-color: #8b2456 !important;
+}
+[data-testid="stVerticalBlockBorderWrapper"]:has(.auth-form-anchor) [data-testid="stExpander"] {
+    background: #fffafd;
+    border: 1px solid #f0d4e1;
+    border-radius: 13px;
+}
+.auth-authorized {
+    text-align: center;
+    color: #715b6d !important;
+    font-size: .8rem;
+    margin-top: .65rem;
+}
+@media (max-width: 780px) {
+    [data-testid="stMainBlockContainer"] {
+        padding-top: 1.15rem !important;
+        padding-left: 1rem !important;
+        padding-right: 1rem !important;
+    }
+    [data-testid="stVerticalBlockBorderWrapper"]:has(.auth-visual-anchor),
+    [data-testid="stVerticalBlockBorderWrapper"]:has(.auth-form-anchor),
+    [data-testid="stVerticalBlockBorderWrapper"]:has(.auth-welcome-anchor) {
+        min-height: auto;
+        border-radius: 22px !important;
+    }
+    .auth-header-art { height: 115px; }
+    [data-testid="stVerticalBlockBorderWrapper"]:has(.auth-visual-anchor) [data-testid="stImage"] img,
+    .auth-visual-fallback { height: 205px; }
+    .auth-welcome-headline { font-size: 2.05rem; }
+    .auth-welcome-kicker { margin-top: .25rem; }
+    .auth-welcome { font-size: 1.85rem; }
+}
+</style>
+"""
+
+# =========================================================
 # BASE DE DATOS · SUPABASE / POSTGRESQL
 # =========================================================
 
@@ -914,7 +1185,7 @@ def _connection_pool():
 
 
 class PgConnection:
-    def __init__(self):
+    def __init__(self, admin=False):
         self._pool = _connection_pool()
         self._conn = self._pool.getconn()
         self._released = False
@@ -927,6 +1198,29 @@ class PgConnection:
                 pass
             self._conn = self._pool.getconn()
 
+        # TODAS las consultas de pantallas usan el rol PostgreSQL authenticated.
+        # El rol postgres de DATABASE_URL se reserva para esquema/gestión Auth.
+        # SET LOCAL se revierte con commit/rollback: seguro con Transaction pooler.
+        if not admin:
+            profile = st.session_state.get("auth_profile")
+            uid = st.session_state.get("auth_uid")
+            if not profile or not uid or str(profile["user_id"]) != str(uid):
+                self._pool.putconn(self._conn)
+                self._released = True
+                raise PermissionError("Inicia sesión para consultar la base de datos.")
+            try:
+                with self._conn.cursor() as cur:
+                    cur.execute("SELECT set_config('request.jwt.claim.sub', %s, true)", (str(uid),))
+                    cur.execute("SELECT set_config('request.jwt.claims', %s, true)",
+                                (json.dumps({"sub": str(uid), "role": "authenticated"}),))
+                    cur.execute("SELECT set_config('request.jwt.claim.role', 'authenticated', true)")
+                    cur.execute("SET LOCAL ROLE authenticated")
+            except Exception:
+                self._conn.rollback()
+                self._pool.putconn(self._conn)
+                self._released = True
+                raise
+
     def cursor(self):
         return PgCursor(self._conn.cursor(cursor_factory=DictCursor))
 
@@ -937,6 +1231,12 @@ class PgConnection:
 
     def commit(self):
         self._conn.commit()
+        # Evita pantallas desactualizadas después de guardar una reserva,
+        # departamento, pago o una asignación de propietario.
+        for name in ("_departments_for_user", "_reservations_for_user"):
+            cached_fn = globals().get(name)
+            if cached_fn is not None:
+                cached_fn.clear()
 
     def rollback(self):
         self._conn.rollback()
@@ -956,13 +1256,18 @@ class PgConnection:
             self._released = True
 
 
-def db():
+def db(admin=False):
+    # admin=True solo está permitido para creación de esquema, alta de cuentas
+    # y lectura del índice RUT -> Auth, nunca para consultas de páginas.
     try:
-        return PgConnection()
+        return PgConnection(admin=admin)
+    except PermissionError:
+        st.error("No tienes una sesión autorizada.")
+        st.stop()
     except Exception:
         st.error(
-            "No fue posible conectar con Supabase. Revisa DATABASE_URL en "
-            "Streamlit Secrets y confirma que estás usando la URI del Transaction pooler."
+            "No fue posible conectar con Supabase. Revisa DATABASE_URL y "
+            "que el SQL de migración se haya aplicado correctamente."
         )
         st.stop()
 
@@ -990,8 +1295,8 @@ def table_columns(table):
 
 @st.cache_resource
 def init_db():
-    """Crea/adapta el esquema una sola vez por proceso de Streamlit."""
-    conn = db()
+    """Compatibilidad con tablas existentes; operaciones DDL exclusivamente backend."""
+    conn = db(admin=True)
     cur = conn.cursor()
 
     cur.execute("""
@@ -1199,6 +1504,240 @@ def init_db():
 init_db()
 
 # =========================================================
+# CONTROL DE ACCESO · RUT + CONTRASEÑA
+# =========================================================
+
+def _profile_by_rut(rut):
+    conn = db(admin=True)
+    try:
+        row = conn.execute("""
+            SELECT user_id, rut, full_name, login_email, role, owner_id,
+                   is_active, must_change_password
+            FROM public.user_profiles WHERE rut=?
+        """, (rut,)).fetchone()
+        return dict(row) if row else None
+    finally:
+        conn.close()
+
+
+def _profile_by_uid(uid):
+    conn = db(admin=True)
+    try:
+        row = conn.execute("""
+            SELECT user_id, rut, full_name, login_email, role, owner_id,
+                   is_active, must_change_password
+            FROM public.user_profiles WHERE user_id=?::uuid
+        """, (uid,)).fetchone()
+        return dict(row) if row else None
+    finally:
+        conn.close()
+
+
+def current_role():
+    profile = st.session_state.get("auth_profile") or {}
+    return profile.get("role")
+
+
+def is_admin():
+    return current_role() == "admin"
+
+
+def _finish_first_access(uid):
+    """Marca la invitación completada tras autenticar con una contraseña personal."""
+    conn = db(admin=True)
+    try:
+        cur = conn.execute("""
+            UPDATE public.user_profiles
+            SET must_change_password = FALSE
+            WHERE user_id = ?::uuid AND is_active = TRUE
+        """, (uid,))
+        if cur.rowcount != 1:
+            raise ValueError("No se pudo completar la activación.")
+        conn.commit()
+    except Exception:
+        conn.rollback()
+        raise
+    finally:
+        conn.close()
+
+
+def _render_login_illustration():
+    """Ilustración elegida por la usuaria o globos suaves de respaldo."""
+    with st.container(border=True):
+        st.markdown('<div class="auth-visual-anchor"></div>', unsafe_allow_html=True)
+        foto = Path(__file__).resolve().parent / "login.png"
+        if foto.is_file():
+            st.image(str(foto), use_container_width=True)
+        else:
+            st.markdown('''<div class="auth-visual-fallback" aria-label="Ilustración decorativa de globos aerostáticos">
+                <svg viewBox="0 0 440 340" xmlns="http://www.w3.org/2000/svg" aria-hidden="true">
+                    <defs>
+                        <linearGradient id="balloonA" x1="0" y1="0" x2="1" y2="1">
+                            <stop stop-color="#ff2b8b"/><stop offset="1" stop-color="#ba2675"/>
+                        </linearGradient>
+                        <linearGradient id="balloonB" x1="0" y1="0" x2="0" y2="1">
+                            <stop stop-color="#f998bc"/><stop offset="1" stop-color="#e94b8b"/>
+                        </linearGradient>
+                    </defs>
+                    <circle cx="218" cy="185" r="115" fill="#ffe7f1"/>
+                    <path d="M0 258 Q60 214 121 258 T244 250 T440 250 V340 H0Z" fill="#fff3f8"/>
+                    <path d="M0 291 Q87 241 159 298 T338 286 T440 292 V340 H0Z" fill="#fff"/>
+                    <g transform="translate(154 38)">
+                        <path d="M0 74 C-36 25 -27 -12 0 -12 C27 -12 36 25 0 74Z" fill="url(#balloonA)"/>
+                        <path d="M0 -12 C-12 -8 -16 45 0 74 C16 45 12 -8 0 -12Z" fill="#ffe1eb"/>
+                        <path d="M0 -12 C-4 -8 -5 44 0 74 C5 44 4 -8 0 -12Z" fill="#ff5b9e"/>
+                        <path d="M-10 66 L-7 84 M10 66 L7 84" stroke="#82405e" stroke-width="2"/>
+                        <rect x="-11" y="82" width="22" height="12" rx="2" fill="#89506a"/>
+                    </g>
+                    <g transform="translate(289 104) scale(.65)">
+                        <path d="M0 74 C-36 25 -27 -12 0 -12 C27 -12 36 25 0 74Z" fill="url(#balloonB)"/>
+                        <path d="M0 -12 C-12 -8 -16 45 0 74 C16 45 12 -8 0 -12Z" fill="#ffe8f1"/>
+                        <path d="M-10 66 L-7 84 M10 66 L7 84" stroke="#82405e" stroke-width="2"/>
+                        <rect x="-11" y="82" width="22" height="12" rx="2" fill="#89506a"/>
+                    </g>
+                    <g fill="#fff" opacity=".93">
+                        <circle cx="84" cy="253" r="17"/><circle cx="106" cy="244" r="26"/><circle cx="137" cy="255" r="17"/>
+                        <circle cx="328" cy="277" r="21"/><circle cx="354" cy="263" r="31"/><circle cx="390" cy="276" r="22"/>
+                    </g>
+                </svg>
+            </div>''', unsafe_allow_html=True)
+        st.markdown('<div class="auth-welcome">Tus arriendos, a tu ritmo</div>',
+                    unsafe_allow_html=True)
+        st.markdown('<div class="auth-welcome-text">Tu próxima reserva, tu calendario '
+                    'y tus propiedades, siempre a mano.</div>', unsafe_allow_html=True)
+        st.markdown('<div class="auth-mini-divider"></div>', unsafe_allow_html=True)
+
+
+def page_login():
+    """Acceso de dos etapas: bienvenida → RUT y contraseña.
+
+    Conserva las invitaciones/recuperación de cuenta y el acceso seguro por RUT.
+    """
+    # Debe mostrarse también durante la bienvenida para que los enlaces de
+    # invitación/recuperación sigan funcionando sin un inicio de sesión previo.
+    activacion.render_activation()
+    st.markdown(LOGIN_CSS, unsafe_allow_html=True)
+
+    if st.session_state.get("auth_step") not in ("welcome", "login"):
+        st.session_state["auth_step"] = "welcome"
+
+    st.markdown('<div class="auth-overline">ARRIENDOS TEMPORALES</div>',
+                unsafe_allow_html=True)
+
+    izquierda, derecha = st.columns([.96, 1.04], gap="large", vertical_alignment="center")
+
+    with izquierda:
+        _render_login_illustration()
+
+    if st.session_state["auth_step"] == "welcome":
+        with derecha:
+            with st.container(border=True):
+                st.markdown('<div class="auth-welcome-anchor"></div>', unsafe_allow_html=True)
+                st.markdown('<div class="auth-welcome-kicker">TU LUGAR PARA ORGANIZARTE</div>',
+                            unsafe_allow_html=True)
+                st.markdown('<div class="auth-welcome-headline">Bienvenido a tu espacio de arriendos</div>',
+                            unsafe_allow_html=True)
+                st.markdown("""<div class="auth-welcome-description">
+                    Tus reservas, departamentos y fechas importantes,
+                    organizados de forma sencilla en un solo lugar.
+                </div>""", unsafe_allow_html=True)
+                st.markdown("""<div class="auth-welcome-features">
+                    <strong>Todo lo que necesitas para gestionar tus arriendos:</strong><br>
+                    Reservas y calendario · Departamentos · Liquidaciones
+                </div>""", unsafe_allow_html=True)
+                if st.button("Empezar", key="auth_start", type="primary",
+                             use_container_width=True):
+                    st.session_state["auth_step"] = "login"
+                    st.rerun()
+                st.markdown('<div class="auth-access-note">Acceso exclusivo para personas autorizadas.</div>',
+                            unsafe_allow_html=True)
+        return
+
+    with derecha:
+        with st.container(border=True):
+            st.markdown('<div class="auth-form-anchor"></div>', unsafe_allow_html=True)
+            st.markdown('''<div class="auth-header-art">
+                <svg viewBox="0 0 470 167" preserveAspectRatio="xMidYMid slice"
+                     xmlns="http://www.w3.org/2000/svg" aria-hidden="true">
+                    <rect width="470" height="167" fill="#f6beda"/>
+                    <g opacity=".72">
+                        <path d="M20 -25 C-28 33 7 107 49 96 C90 85 99 22 48 -25" fill="#e97eae"/>
+                        <path d="M48 -25 C33 7 36 71 49 96 C62 71 65 7 48 -25" fill="#fce2ec"/>
+                        <path d="M29 80 L35 110 M69 80 L63 110" stroke="#a95080" stroke-width="2"/>
+                        <rect x="32" y="110" width="35" height="14" rx="3" fill="#b15b88"/>
+                    </g>
+                    <g opacity=".58" transform="translate(212 48) scale(.54)">
+                        <path d="M0 60 C-40 7 -30 -25 0 -25 C30 -25 40 7 0 60Z" fill="#db72a8"/>
+                        <path d="M0 -25 C-14 -19 -19 29 0 60 C19 29 14 -19 0 -25Z" fill="#ffeaf2"/>
+                        <path d="M-8 55 L-5 70 M8 55 L5 70" stroke="#874a72" stroke-width="3"/>
+                        <rect x="-10" y="70" width="20" height="12" rx="3" fill="#a65a86"/>
+                    </g>
+                    <path d="M-30 160 Q70 96 155 142 T354 127 T500 124 V188 H-30Z" fill="#ffeaf3"/>
+                    <path d="M-20 174 Q92 127 170 166 T362 160 T500 154 V191 H-20Z" fill="#fff8fb"/>
+                    <g fill="#fff8fb">
+                        <circle cx="382" cy="125" r="31"/><circle cx="418" cy="107" r="39"/>
+                        <circle cx="462" cy="132" r="32"/>
+                    </g>
+                </svg>
+            </div>''', unsafe_allow_html=True)
+            st.markdown('<div class="auth-form-kicker">TU CUENTA PERSONAL</div>',
+                        unsafe_allow_html=True)
+            st.markdown('<div class="auth-form-heading">Iniciar sesión</div>',
+                        unsafe_allow_html=True)
+            st.markdown('<div class="auth-form-subtitle">Ingresa con tu RUT y '
+                        'tu contraseña personal.</div>', unsafe_allow_html=True)
+
+            with st.form("rut_login"):
+                rut = st.text_input("RUT", placeholder="12.345.678-5")
+                pwd = st.text_input("Contraseña", type="password",
+                                    placeholder="Ingresa tu contraseña")
+                sent = st.form_submit_button("Iniciar sesión", type="primary",
+                                             use_container_width=True)
+
+            if sent:
+                try:
+                    acceso.sign_in(rut, pwd, _profile_by_rut, _finish_first_access)
+                except Exception:
+                    st.error("RUT o contraseña incorrectos, o cuenta todavía no activada.")
+                else:
+                    st.session_state.page = "Inicio"
+                    st.rerun()
+
+            with st.expander("¿Olvidaste tu contraseña?"):
+                st.caption("Solicita un enlace de recuperación al correo de tu cuenta.")
+                with st.form("password_recovery"):
+                    recovered_rut = st.text_input("Tu RUT", key="recover_rut")
+                    send_recovery = st.form_submit_button("Solicitar enlace")
+                if send_recovery:
+                    try:
+                        r = acceso.normalize_rut(recovered_rut)
+                        p = _profile_by_rut(r)
+                        if p and p.get("is_active"):
+                            acceso.send_password_recovery(p["login_email"])
+                    except Exception:
+                        pass
+                    st.info("Si tu cuenta tiene acceso habilitado, recibirás instrucciones por correo.")
+
+            st.markdown('<div class="auth-authorized">Acceso exclusivo para cuentas '
+                        'autorizadas.</div>', unsafe_allow_html=True)
+
+            if st.button("← Volver a bienvenida", key="auth_back", use_container_width=True):
+                st.session_state["auth_step"] = "welcome"
+                st.rerun()
+
+
+try:
+    _profile = acceso.current_profile(_profile_by_uid)
+except Exception:
+    st.error("No se pudo comprobar la sesión. Revisa los Secrets de Supabase Auth.")
+    st.stop()
+if _profile is None:
+    st.markdown("<style>[data-testid='stSidebar'] {display:none !important;}</style>",
+                unsafe_allow_html=True)
+    page_login()
+    st.stop()
+
+# =========================================================
 # FUNCIONES
 # =========================================================
 
@@ -1210,7 +1749,7 @@ def department_columns():
     return table_columns("departments")
 
 
-def insert_department(condo, name, capacity, winter, summer):
+def insert_department(condo, name, capacity, winter, summer, owner_id):
     """Inserta un departamento y mantiene compatibilidad con esquemas antiguos."""
     conn = db()
     cols = department_columns()
@@ -1218,15 +1757,15 @@ def insert_department(condo, name, capacity, winter, summer):
     if "condominium" in cols:
         conn.execute("""
             INSERT INTO departments
-            (condo, condominium, name, capacity, winter_price, summer_price)
-            VALUES (?, ?, ?, ?, ?, ?)
-        """, (condo, condo, name, capacity, winter, summer))
+            (condo, condominium, name, capacity, winter_price, summer_price, owner_id)
+            VALUES (?, ?, ?, ?, ?, ?, ?)
+        """, (condo, condo, name, capacity, winter, summer, owner_id))
     else:
         conn.execute("""
             INSERT INTO departments
-            (condo, name, capacity, winter_price, summer_price)
-            VALUES (?, ?, ?, ?, ?)
-        """, (condo, name, capacity, winter, summer))
+            (condo, name, capacity, winter_price, summer_price, owner_id)
+            VALUES (?, ?, ?, ?, ?, ?)
+        """, (condo, name, capacity, winter, summer, owner_id))
 
     conn.commit()
     conn.close()
@@ -1242,27 +1781,48 @@ def delete_reservation(reservation_id):
     conn.close()
 
 
-def get_departments():
+@st.cache_data(ttl=15, max_entries=128, show_spinner=False)
+def _departments_for_user(user_id, owner_id):
+    """Caché por usuario. Nunca compartir resultados entre propietarios."""
     conn = db()
-    rows = conn.execute("""
-        SELECT * FROM departments
-        WHERE active=1
-        ORDER BY condo, name
-    """).fetchall()
-    conn.close()
-    return rows
+    try:
+        rows = conn.execute("""
+            SELECT d.*, o.rut AS owner_rut, o.full_name AS owner_name
+            FROM departments d LEFT JOIN owners o ON o.id=d.owner_id
+            WHERE d.active=1
+            ORDER BY d.condo, d.name
+        """).fetchall()
+        return [dict(row) for row in rows]
+    finally:
+        conn.close()
+
+
+def get_departments():
+    profile = st.session_state["auth_profile"]
+    return _departments_for_user(str(st.session_state["auth_uid"]),
+                                 str(profile.get("owner_id") or "admin"))
+
+
+@st.cache_data(ttl=15, max_entries=128, show_spinner=False)
+def _reservations_for_user(user_id, owner_id):
+    """RLS sigue aplicado al consultar y la caché está aislada por identidad."""
+    conn = db()
+    try:
+        rows = conn.execute("""
+            SELECT r.*, d.name AS dept_name, d.condo, d.capacity
+            FROM reservations r
+            JOIN departments d ON d.id=r.department_id
+            ORDER BY r.check_in
+        """).fetchall()
+        return [dict(row) for row in rows]
+    finally:
+        conn.close()
 
 
 def get_reservations():
-    conn = db()
-    rows = conn.execute("""
-        SELECT r.*, d.name AS dept_name, d.condo, d.capacity
-        FROM reservations r
-        JOIN departments d ON d.id=r.department_id
-        ORDER BY r.check_in
-    """).fetchall()
-    conn.close()
-    return rows
+    profile = st.session_state["auth_profile"]
+    return _reservations_for_user(str(st.session_state["auth_uid"]),
+                                  str(profile.get("owner_id") or "admin"))
 
 
 def get_reservation(reservation_id):
@@ -1308,81 +1868,88 @@ def save_reservation(
     deposited = round(total * (deposit_percent / 100))
 
     conn = db()
-    cur = conn.cursor()
-    reservation_columns = table_columns("reservations")
+    try:
+        cur = conn.cursor()
+        reservation_columns = table_columns("reservations")
 
-    if reservation_id:
-        if "guest_name" in reservation_columns:
-            cur.execute("""
-                UPDATE reservations
-                SET department_id=?, guest=?, guest_name=?, phone=?, check_in=?,
-                    check_in_time=?, check_out=?, check_out_time=?,
-                    guests=?, price_night=?, nights=?, total=?,
-                    deposit_percent=?, deposited=?, status=?
-                WHERE id=?
-            """, (
-                department_id, guest, guest, phone, check_in.isoformat(),
-                check_in_time, check_out.isoformat(), check_out_time,
-                guests, price_night, nights, total,
-                deposit_percent, deposited, status, reservation_id
-            ))
+        if reservation_id:
+            if not is_admin():
+                raise PermissionError("Solo la administradora puede editar una reserva.")
+            if "guest_name" in reservation_columns:
+                cur.execute("""
+                    UPDATE reservations
+                    SET department_id=?, guest=?, guest_name=?, phone=?, check_in=?,
+                        check_in_time=?, check_out=?, check_out_time=?,
+                        guests=?, price_night=?, nights=?, total=?,
+                        deposit_percent=?, deposited=?, status=?
+                    WHERE id=?
+                """, (
+                    department_id, guest, guest, phone, check_in.isoformat(),
+                    check_in_time, check_out.isoformat(), check_out_time,
+                    guests, price_night, nights, total,
+                    deposit_percent, deposited, status, reservation_id
+                ))
+            else:
+                cur.execute("""
+                    UPDATE reservations
+                    SET department_id=?, guest=?, phone=?, check_in=?,
+                        check_in_time=?, check_out=?, check_out_time=?,
+                        guests=?, price_night=?, nights=?, total=?,
+                        deposit_percent=?, deposited=?, status=?
+                    WHERE id=?
+                """, (
+                    department_id, guest, phone, check_in.isoformat(),
+                    check_in_time, check_out.isoformat(), check_out_time,
+                    guests, price_night, nights, total,
+                    deposit_percent, deposited, status, reservation_id
+                ))
+            rid = reservation_id
         else:
-            cur.execute("""
-                UPDATE reservations
-                SET department_id=?, guest=?, phone=?, check_in=?,
-                    check_in_time=?, check_out=?, check_out_time=?,
-                    guests=?, price_night=?, nights=?, total=?,
-                    deposit_percent=?, deposited=?, status=?
-                WHERE id=?
-            """, (
-                department_id, guest, phone, check_in.isoformat(),
-                check_in_time, check_out.isoformat(), check_out_time,
-                guests, price_night, nights, total,
-                deposit_percent, deposited, status, reservation_id
-            ))
-        rid = reservation_id
-    else:
-        if "guest_name" in reservation_columns:
-            cur.execute("""
-                INSERT INTO reservations
-                (department_id, guest, guest_name, phone, check_in, check_in_time,
-                 check_out, check_out_time, guests, price_night, nights,
-                 total, deposit_percent, deposited, status)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                RETURNING id
-            """, (
-                department_id, guest, guest, phone, check_in.isoformat(),
-                check_in_time, check_out.isoformat(), check_out_time,
-                guests, price_night, nights, total,
-                deposit_percent, deposited, status
-            ))
-        else:
-            cur.execute("""
-                INSERT INTO reservations
-                (department_id, guest, phone, check_in, check_in_time,
-                 check_out, check_out_time, guests, price_night, nights,
-                 total, deposit_percent, deposited, status)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                RETURNING id
-            """, (
-                department_id, guest, phone, check_in.isoformat(),
-                check_in_time, check_out.isoformat(), check_out_time,
-                guests, price_night, nights, total,
-                deposit_percent, deposited, status
-            ))
+            if "guest_name" in reservation_columns:
+                cur.execute("""
+                    INSERT INTO reservations
+                    (department_id, guest, guest_name, phone, check_in, check_in_time,
+                     check_out, check_out_time, guests, price_night, nights,
+                     total, deposit_percent, deposited, status, created_by)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    RETURNING id
+                """, (
+                    department_id, guest, guest, phone, check_in.isoformat(),
+                    check_in_time, check_out.isoformat(), check_out_time,
+                    guests, price_night, nights, total,
+                    deposit_percent, deposited, status, st.session_state["auth_uid"]
+                ))
+            else:
+                cur.execute("""
+                    INSERT INTO reservations
+                    (department_id, guest, phone, check_in, check_in_time,
+                     check_out, check_out_time, guests, price_night, nights,
+                     total, deposit_percent, deposited, status, created_by)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    RETURNING id
+                """, (
+                    department_id, guest, phone, check_in.isoformat(),
+                    check_in_time, check_out.isoformat(), check_out_time,
+                    guests, price_night, nights, total,
+                    deposit_percent, deposited, status, st.session_state["auth_uid"]
+                ))
 
-        rid = cur.fetchone()["id"]
+            rid = cur.fetchone()["id"]
 
-        cur.execute("""
-            INSERT INTO checklist
-            (reservation_id, cleaning, internet, inspected, keys)
-            VALUES (?, 0, 0, 0, 0)
-            ON CONFLICT (reservation_id) DO NOTHING
-        """, (rid,))
+            cur.execute("""
+                INSERT INTO checklist
+                (reservation_id, cleaning, internet, inspected, keys)
+                VALUES (?, 0, 0, 0, 0)
+                ON CONFLICT (reservation_id) DO NOTHING
+            """, (rid,))
 
-    conn.commit()
-    conn.close()
-    return rid
+        conn.commit()
+        return rid
+    except Exception:
+        conn.rollback()
+        raise
+    finally:
+        conn.close()
 
 
 def update_checklist(reservation_id, cleaning, internet, inspected, keys):
@@ -1419,7 +1986,7 @@ def get_checklist(reservation_id):
 
 def set_page(page, reservation_id=None):
     st.session_state.page = page
-    if page in ("Inicio", "Reservas", "Calendario", "Departamentos", "Liquidaciones"):
+    if page in ("Inicio", "Reservas", "Calendario", "Departamentos", "Liquidaciones", "Propietarios", "Mi cuenta"):
         # Los accesos directos desde Detalle no deben volver accidentalmente a Inicio.
         st.session_state.nav_choice = page
     if reservation_id is not None:
@@ -1474,12 +2041,29 @@ def reminders_for(reservations):
     today = date.today()
     reminders = []
 
+    # Antes se abría una conexión y se consultaba checklist por CADA reserva,
+    # incluso por reservas antiguas. Ahora consultamos solo las llegadas de mañana.
+    tomorrow_ids = [int(r["id"]) for r in reservations
+                    if date.fromisoformat(r["check_in"]) == today + timedelta(days=1)]
+    checklists = {}
+    if tomorrow_ids:
+        conn = db()
+        try:
+            rows = conn.execute(
+                "SELECT reservation_id, cleaning, internet "
+                "FROM checklist WHERE reservation_id = ANY(%s)",
+                (tomorrow_ids,),
+            ).fetchall()
+            checklists = {int(row["reservation_id"]): row for row in rows}
+        finally:
+            conn.close()
+
     for r in reservations:
         ci = date.fromisoformat(r["check_in"])
         co = date.fromisoformat(r["check_out"])
         days_to_in = (ci - today).days
         days_to_out = (co - today).days
-        checklist = get_checklist(r["id"])
+        checklist = checklists.get(int(r["id"])) if days_to_in == 1 else None
 
         if days_to_in == 2:
             reminders.append((
@@ -1542,13 +2126,10 @@ if "page" not in st.session_state:
 if "selected_reservation" not in st.session_state:
     st.session_state.selected_reservation = None
 
-pages = [
-    "Inicio",
-    "Reservas",
-    "Calendario",
-    "Departamentos",
-    "Liquidaciones",
-]
+pages = ["Inicio", "Reservas", "Calendario", "Departamentos", "Liquidaciones"]
+if is_admin():
+    pages.append("Propietarios")
+pages.append("Mi cuenta")
 
 with st.sidebar:
     st.markdown('<div class="brand">🌸 Arriendos</div>', unsafe_allow_html=True)
@@ -1580,8 +2161,13 @@ with st.sidebar:
 
     st.divider()
 
-    st.caption("Panel de administración")
+    st.caption(f"{st.session_state['auth_profile']['full_name']}")
+    st.caption("Administración" if is_admin() else "Panel de propietario")
     st.caption(date.today().strftime("%d/%m/%Y"))
+    if st.button("Cerrar sesión", use_container_width=True):
+        acceso.clear_session()
+        st.session_state["auth_step"] = "welcome"
+        st.rerun()
 
 # =========================================================
 # INICIO
@@ -1657,9 +2243,9 @@ def _archivo_a_data_uri(file_path):
         return None
 
 
-@st.cache_data(ttl=3600, show_spinner=False)
-def _get_condo_image_cached(condo_key):
-    """Trae una foto de Supabase y la mantiene en caché para evitar descargas repetidas."""
+@st.cache_data(ttl=3600, max_entries=256, show_spinner=False)
+def _get_condo_image_cached(user_id, condo_key):
+    """Caché de imágenes por usuario para evitar mezclar accesos de propietarios."""
     if not condo_key:
         return None
 
@@ -1678,7 +2264,8 @@ def _get_condo_image_cached(condo_key):
 
 def _get_condo_image_row(condo):
     """Compatibilidad: devuelve los bytes/mime cacheados del edificio."""
-    return _get_condo_image_cached(_slug_archivo(condo))
+    return _get_condo_image_cached(str(st.session_state["auth_uid"]),
+                                   _slug_archivo(condo))
 
 
 def _condo_has_saved_image(condo):
@@ -1943,9 +2530,9 @@ def page_inicio():
                     f"""
                     <div class="reservation-card">
                         <span class="reservation-tag">Próximo arriendo</span>
-                        <div class="reservation-name">{r['guest']}</div>
+                        <div class="reservation-name">{html_escape(str(r['guest']))}</div>
                         <div class="reservation-info">
-                            🏢 {r['dept_name']} · {r['condo']}<br>
+                            🏢 {html_escape(str(r['dept_name']))} · {html_escape(str(r['condo']))}<br>
                             📅 {fecha_corta_espanol(ci)} → {fecha_corta_espanol(co)} {co.year}<br>
                             👥 {r['guests']} huéspedes · 🌙 {r['nights']} noches
                         </div>
@@ -1973,8 +2560,8 @@ def page_inicio():
         st.markdown(
             f"""
             <div class="reminder">
-                <div class="reminder-title">{title}</div>
-                <div class="reminder-text">{text_value}</div>
+                <div class="reminder-title">{html_escape(title)}</div>
+                <div class="reminder-text">{html_escape(text_value)}</div>
             </div>
             """,
             unsafe_allow_html=True
@@ -2183,11 +2770,11 @@ def page_reservas():
                 f"""
                 <div class="detail-box">
                     <div class="detail-label">HUÉSPED</div>
-                    <div class="detail-value">{reviewed["guest"]}</div><br>
+                    <div class="detail-value">{html_escape(reviewed["guest"])}</div><br>
                     <div class="detail-label">CONTACTO</div>
-                    <div class="detail-value">{reviewed["phone"] or "No registrado"}</div><br>
+                    <div class="detail-value">{html_escape(reviewed["phone"] or "No registrado")}</div><br>
                     <div class="detail-label">DEPARTAMENTO</div>
-                    <div class="detail-value">🏢 {reviewed["condo"]} · {reviewed["dept_name"]}</div><br>
+                    <div class="detail-value">🏢 {html_escape(reviewed["condo"])} · {html_escape(reviewed["dept_name"])}</div><br>
                     <div class="detail-label">ESTADÍA</div>
                     <div class="detail-value">
                         {reviewed["check_in"].strftime("%d/%m/%Y")} · {reviewed["check_in_time"].strftime("%H:%M")}
@@ -2235,7 +2822,7 @@ def page_reservas():
                     use_container_width=True,
                     key="confirm_reservation"
                 ):
-                    # Última comprobación, justo antes de escribir en SQLite.
+                    # Última comprobación visual; PostgreSQL evita cruces simultáneos.
                     conflict = conflict_exists(
                         reviewed["department_id"],
                         reviewed["check_in"],
@@ -2250,25 +2837,31 @@ def page_reservas():
                             f"hasta {date.fromisoformat(conflict['check_out']).strftime('%d/%m/%Y')}."
                         )
                     else:
-                        rid = save_reservation(
-                            reviewed["department_id"],
-                            reviewed["guest"],
-                            reviewed["phone"],
-                            reviewed["check_in"],
-                            reviewed["check_in_time"].strftime("%H:%M"),
-                            reviewed["check_out"],
-                            reviewed["check_out_time"].strftime("%H:%M"),
-                            reviewed["guests"],
-                            reviewed["price"],
-                            reviewed["deposit_percent"],
-                            "Pagado completamente" if reviewed["deposit_percent"] == 100 else (
-                                "Sin abono" if reviewed["deposit_percent"] == 0 else "Abono recibido"
+                        try:
+                            rid = save_reservation(
+                                reviewed["department_id"],
+                                reviewed["guest"],
+                                reviewed["phone"],
+                                reviewed["check_in"],
+                                reviewed["check_in_time"].strftime("%H:%M"),
+                                reviewed["check_out"],
+                                reviewed["check_out_time"].strftime("%H:%M"),
+                                reviewed["guests"],
+                                reviewed["price"],
+                                reviewed["deposit_percent"],
+                                "Pagado completamente" if reviewed["deposit_percent"] == 100 else (
+                                    "Sin abono" if reviewed["deposit_percent"] == 0 else "Abono recibido"
+                                )
                             )
-                        )
-                        st.session_state.reservation_review = None
-                        st.session_state.selected_reservation = rid
-                        st.success("Reserva guardada correctamente.")
-                        st.rerun()
+                        except psycopg2.errors.ExclusionViolation:
+                            st.error("Otro usuario reservó esas fechas antes. Revisa el calendario.")
+                        except Exception:
+                            st.error("No fue posible confirmar la reserva. Revisa disponibilidad y permisos.")
+                        else:
+                            st.session_state.reservation_review = None
+                            st.session_state.selected_reservation = rid
+                            st.success("Reserva confirmada y compartida en ambos calendarios.")
+                            st.rerun()
 
             with cancel_col:
                 if st.button(
@@ -2292,7 +2885,7 @@ def page_reservas():
                 st.markdown(
                     f"""
                     <div class="detail-box compact">
-                        <b>{r['guest']}</b><br>
+                        <b>{html_escape(str(r['guest']))}</b><br>
                         <span style="color:{MUTED}">
                         {r['condo']} · {r['dept_name']} ·
                         {ci.strftime('%d/%m/%Y')} → {co.strftime('%d/%m/%Y')}
@@ -2343,8 +2936,8 @@ def page_detalle():
     st.markdown('<div class="main-title">Detalle de reserva</div>', unsafe_allow_html=True)
     st.markdown(
         f"""<div class="reservation-heading">
-            <span class="reservation-heading-guest">{r['guest']}</span>
-            <span class="reservation-heading-place">🏢 {r['condo']} · {r['dept_name']}</span>
+            <span class="reservation-heading-guest">{html_escape(str(r['guest']))}</span>
+            <span class="reservation-heading-place">🏢 {html_escape(str(r['condo']))} · {html_escape(str(r['dept_name']))}</span>
         </div>""",
         unsafe_allow_html=True
     )
@@ -2362,11 +2955,11 @@ def page_detalle():
             f"""
             <div class="detail-box compact">
                 <div class="detail-label">HUÉSPED</div>
-                <div class="detail-value">{r['guest']}</div><br>
+                <div class="detail-value">{html_escape(str(r['guest']))}</div><br>
                 <div class="detail-label">CONTACTO</div>
-                <div class="detail-value">{r['phone'] or 'No registrado'}</div><br>
+                <div class="detail-value">{html_escape(str(r['phone'] or 'No registrado'))}</div><br>
                 <div class="detail-label">DEPARTAMENTO</div>
-                <div class="detail-value">{r['condo']} · {r['dept_name']}</div>
+                <div class="detail-value">{html_escape(str(r['condo']))} · {html_escape(str(r['dept_name']))}</div>
             </div>
             """,
             unsafe_allow_html=True
@@ -2386,6 +2979,15 @@ def page_detalle():
             """,
             unsafe_allow_html=True
         )
+
+    if not is_admin():
+        st.markdown('<div class="section-title">Estado de la reserva</div>', unsafe_allow_html=True)
+        c1, c2, c3 = st.columns(3)
+        c1.metric("Total", money(r["total"]))
+        c2.metric("Abonado", money(r["deposited"]))
+        c3.metric("Saldo", money(balance))
+        st.caption("La administradora gestiona pagos, modificaciones y liquidaciones.")
+        return
 
     st.button(
         "Crear o consultar liquidación del propietario",
@@ -2782,7 +3384,7 @@ def page_calendario():
 
                     st.markdown(
                         f"""
-                        <div class="{cls}" title="{guest_name if busy else 'Disponible'}">
+                        <div class="{cls}" title="{html_escape(str(guest_name)) if busy else 'Disponible'}">
                             <div class="calendar-day-number">{day_num}</div>
                             <div class="calendar-status {status_class}">{dot} {status_text}</div>
                         </div>
@@ -2872,8 +3474,8 @@ def page_calendario():
                         st.markdown(
                             f"""
                             <div class="search-result-card">
-                                <div class="search-result-building">🏢 {d['condo']}</div>
-                                <div class="search-result-name">{d['name']}</div>
+                                <div class="search-result-building">🏢 {html_escape(str(d['condo']))}</div>
+                                <div class="search-result-name">{html_escape(str(d['name']))}</div>
                                 <div>👥 Hasta {d['capacity']} huéspedes</div>
                                 <div>🌙 {nights_search} noche(s)</div>
                                 <div>☀️ Verano · {money(d['summer_price'])} / noche</div>
@@ -2896,12 +3498,32 @@ def page_calendario():
 # =========================================================
 
 def page_departamentos():
+    if not is_admin():
+        page_section_header("Mis departamentos", "Propiedades vinculadas a tu RUT.")
+        departments = get_departments()
+        if not departments:
+            st.info("Aún no tienes departamentos asociados. Solicita a la administradora que los asigne.")
+            return
+        cols = st.columns(3)
+        for i, d in enumerate(departments):
+            with cols[i % 3]:
+                with st.container(border=True):
+                    st.markdown(f"**{html_escape(d['condo'])} · {html_escape(d['name'])}**")
+                    st.write(f"Capacidad: {d['capacity']} huéspedes")
+                    st.write(f"Invierno: {money(d['winter_price'])}")
+                    st.write(f"Verano: {money(d['summer_price'])}")
+                    st.caption(f"RUT propietario: {d['owner_rut']}")
+        return
     page_section_header(
         "Departamentos",
         "Explora tus edificios y administra los departamentos de cada uno."
     )
 
     departments = get_departments()
+    owners = admin_owners()
+    owner_labels = {f"{o['full_name']} · {o['rut']}": o['id'] for o in owners}
+    if not owners:
+        st.warning("Primero registra un propietario desde la sección Propietarios.")
 
     with st.expander("＋ Agregar departamento"):
         st.caption(
@@ -2919,6 +3541,11 @@ def page_departamentos():
             placeholder="Ej. Depto 305",
             key="new_department_name"
         )
+
+        selected_owner_label = st.selectbox(
+            "RUT del dueño / propietario", list(owner_labels),
+            key="new_department_owner", disabled=not bool(owner_labels),
+        ) if owner_labels else None
 
         clean_condo = condo.strip()
         existing_condo_names = {str(d["condo"]).strip() for d in departments}
@@ -2966,8 +3593,8 @@ def page_departamentos():
             )
 
         if st.button("Agregar departamento", type="primary", use_container_width=True):
-            if not clean_condo or not name.strip():
-                st.warning("Completa el edificio/condominio y el departamento.")
+            if not clean_condo or not name.strip() or not selected_owner_label:
+                st.warning("Completa el edificio, departamento y propietario.")
             else:
                 # Si el usuario escribió el mismo edificio con diferencias de mayúsculas,
                 # reutilizamos el nombre que ya existe para mantener todo agrupado.
@@ -2984,7 +3611,8 @@ def page_departamentos():
                         name.strip(),
                         capacity,
                         winter,
-                        summer
+                        summer,
+                        owner_labels[selected_owner_label]
                     )
                     st.success("Departamento agregado correctamente.")
                     st.rerun()
@@ -3021,7 +3649,7 @@ def page_departamentos():
                         <div class="building-overlay"></div>
                         <div class="building-content">
                             <div class="building-kicker">Edificio / condominio</div>
-                            <div class="building-name">{condo}</div>
+                            <div class="building-name">{html_escape(str(condo))}</div>
                             <div class="building-count">🏠 {len(deps)} departamento(s)</div>
                         </div>
                     </div>
@@ -3034,7 +3662,7 @@ def page_departamentos():
                     <div class="building-card building-fallback">
                         <div class="building-content">
                             <div class="building-kicker">Edificio / condominio</div>
-                            <div class="building-name">{condo}</div>
+                            <div class="building-name">{html_escape(str(condo))}</div>
                             <div class="building-count">🏠 {len(deps)} departamento(s)</div>
                         </div>
                     </div>
@@ -3089,8 +3717,9 @@ def page_departamentos():
                         st.markdown(
                             f"""
                             <div class="dept-card">
-                                <div class="dept-name">{d['name']}</div>
-                                <div class="dept-condo">{d['condo']}</div>
+                                <div class="dept-name">{html_escape(str(d['name']))}</div>
+                                <div class="dept-condo">{html_escape(str(d['condo']))}</div>
+                                <div>RUT dueño: {d['owner_rut'] or 'Sin asignar'}</div>
                                 <div>👥 Hasta {d['capacity']} huéspedes</div>
                                 <div>❄️ Invierno · {money(d['winter_price'])}</div>
                                 <div>☀️ Verano · {money(d['summer_price'])}</div>
@@ -3100,6 +3729,18 @@ def page_departamentos():
                         )
 
                         with st.expander("Modificar"):
+                            current_owner_id = d["owner_id"]
+                            owner_options = ["Sin asignar"] + list(owner_labels)
+                            owner_current_label = next(
+                                (lbl for lbl, oid in owner_labels.items() if oid == current_owner_id),
+                                "Sin asignar",
+                            )
+                            selected_edit_owner = st.selectbox(
+                                "RUT propietario", owner_options,
+                                index=owner_options.index(owner_current_label),
+                                key=f"owner_d_{d['id']}",
+                            )
+                            next_owner_id = owner_labels.get(selected_edit_owner)
                             new_name = st.text_input(
                                 "Nombre",
                                 value=d["name"],
@@ -3132,15 +3773,15 @@ def page_departamentos():
                                 if "condominium" in cols_db:
                                     conn.execute("""
                                         UPDATE departments
-                                        SET name=?, capacity=?, winter_price=?, summer_price=?, condominium=condo
+                                        SET name=?, capacity=?, winter_price=?, summer_price=?, owner_id=?, condominium=condo
                                         WHERE id=?
-                                    """, (new_name, new_capacity, new_winter, new_summer, d["id"]))
+                                    """, (new_name, new_capacity, new_winter, new_summer, next_owner_id, d["id"]))
                                 else:
                                     conn.execute("""
                                         UPDATE departments
-                                        SET name=?, capacity=?, winter_price=?, summer_price=?
+                                        SET name=?, capacity=?, winter_price=?, summer_price=?, owner_id=?
                                         WHERE id=?
-                                    """, (new_name, new_capacity, new_winter, new_summer, d["id"]))
+                                    """, (new_name, new_capacity, new_winter, new_summer, next_owner_id, d["id"]))
                                 conn.commit()
                                 conn.close()
                                 st.success("Departamento actualizado.")
@@ -3566,7 +4207,7 @@ def page_historial_liquidaciones():
                             use_container_width=True
                         )
                 with action_edit:
-                    if st.button("Editar", key=f"liq_edit_card_{sid}", use_container_width=True):
+                    if is_admin() and st.button("Editar", key=f"liq_edit_card_{sid}", use_container_width=True):
                         st.session_state.liquidation_selected_reservation = int(document["reservation_id"])
                         st.session_state.liq_condo_filter = "Todos"
                         st.session_state.liq_department_filter = "Todos"
@@ -3797,6 +4438,10 @@ def page_preparar_liquidacion():
 
 
 def page_liquidaciones():
+    if not is_admin():
+        page_section_header("Mis liquidaciones", "Comprobantes de tus departamentos.")
+        page_historial_liquidaciones()
+        return
     # Usa la misma portada y paleta que la pantalla Inicio.
     page_section_header(
         "Liquidaciones",
@@ -3813,6 +4458,162 @@ def page_liquidaciones():
         page_preparar_liquidacion()
     else:
         page_historial_liquidaciones()
+
+
+
+# =========================================================
+# PROPIETARIOS / CUENTAS AUTORIZADAS
+# =========================================================
+
+def admin_owners():
+    if not is_admin():
+        raise PermissionError("Sin permiso")
+    conn = db()
+    try:
+        return [dict(r) for r in conn.execute("""
+            SELECT o.*, p.user_id, p.is_active AS login_active,
+                   p.login_email AS account_email, p.must_change_password AS invitation_pending
+            FROM public.owners o LEFT JOIN public.user_profiles p ON p.owner_id=o.id
+            ORDER BY o.full_name
+        """).fetchall()]
+    finally:
+        conn.close()
+
+
+def page_propietarios():
+    if not is_admin():
+        st.stop()
+    page_section_header("Propietarios", "Registra propietarios y autoriza el acceso por RUT.")
+    st.caption("Tener un RUT registrado no habilita el acceso. Debe existir una cuenta Auth activa.")
+
+    with st.expander("＋ Registrar propietario", expanded=False):
+        with st.form("form_nuevo_propietario", clear_on_submit=True):
+            rut_input = st.text_input("RUT del propietario")
+            nombre = st.text_input("Nombre completo")
+            telefono = st.text_input("Teléfono (opcional)")
+            email = st.text_input("Correo real para la cuenta y recuperación (opcional al registrar)")
+            submit = st.form_submit_button("Guardar propietario", type="primary")
+        if submit:
+            try:
+                rut = acceso.normalize_rut(rut_input)
+                if not nombre.strip():
+                    raise ValueError("Ingresa el nombre del propietario.")
+                conn = db()
+                try:
+                    conn.execute("""
+                        INSERT INTO public.owners (rut, full_name, phone, email)
+                        VALUES (?, ?, ?, ?)
+                    """, (rut, nombre.strip(), telefono.strip(), email.strip().lower()))
+                    conn.commit()
+                finally:
+                    conn.close()
+                st.success("Propietario registrado. Ahora puedes vincular sus departamentos.")
+                st.rerun()
+            except psycopg2.errors.UniqueViolation:
+                st.error("Ese RUT ya está registrado.")
+            except Exception as exc:
+                st.error(f"No se pudo registrar al propietario: {exc}")
+
+    owners = admin_owners()
+    if not owners:
+        st.info("Todavía no hay propietarios.")
+        return
+    depts = get_departments()
+    for o in owners:
+        with st.container(border=True):
+            left, right = st.columns([2, 2])
+            with left:
+                st.markdown(f"**{html_escape(o['full_name'])}**")
+                st.caption(f"RUT: {o['rut']} · {o['phone'] or 'Sin teléfono'}")
+            with right:
+                st.caption("Invitación pendiente" if o.get("user_id") and o.get("invitation_pending")
+                           else "Acceso activo" if o.get("user_id") and o.get("login_active")
+                           else "Sin acceso" if not o.get("user_id") else "Acceso deshabilitado")
+                dep_count = sum(int(d['owner_id']==o['id']) for d in depts)
+                st.caption(f"Departamentos asociados: {dep_count}")
+            if not o.get("user_id"):
+                with st.expander("Enviar invitación de acceso"):
+                    st.info("El propietario recibirá un enlace para crear una contraseña personal. "
+                            "No se utilizará su RUT como contraseña.")
+                    with st.form(f"activar_{o['id']}"):
+                        real_email = st.text_input("Correo del propietario", value=o['email'] or "",
+                                                   key=f"mail_owner_{o['id']}")
+                        verified = st.checkbox("Confirmo que el correo pertenece al propietario",
+                                               key=f"checked_email_owner_{o['id']}")
+                        activate = st.form_submit_button("Enviar invitación", type="primary")
+                    if activate:
+                        if not verified or '@' not in real_email:
+                            st.error("Verifica el correo del propietario.")
+                        else:
+                            auth_uid = None
+                            try:
+                                auth_uid = acceso.invite_owner(real_email, o['full_name'])
+                                conn = db()
+                                try:
+                                    conn.execute("""
+                                        INSERT INTO public.user_profiles
+                                        (user_id, rut, full_name, login_email, role, owner_id,
+                                         is_active, must_change_password)
+                                        VALUES (?::uuid, ?, ?, ?, 'owner', ?, true, true)
+                                    """, (auth_uid, o['rut'], o['full_name'], real_email.strip().lower(), o['id']))
+                                    conn.execute("UPDATE public.owners SET email=? WHERE id=?",
+                                                 (real_email.strip().lower(), o['id']))
+                                    conn.commit()
+                                finally:
+                                    conn.close()
+                                st.success("Invitación solicitada. El propietario debe abrir el enlace "
+                                           "del correo, crear una contraseña y luego ingresar con su RUT.")
+                            except Exception:
+                                if auth_uid:
+                                    try:
+                                        acceso.delete_auth_user(auth_uid)
+                                    except Exception:
+                                        pass
+                                st.error("No se pudo enviar la invitación. Verifica el correo, "
+                                         "la configuración SMTP y la URL pública de la app.")
+            else:
+                enabled = bool(o.get("login_active"))
+                if st.button("Deshabilitar acceso" if enabled else "Habilitar acceso",
+                             key=f"toggle_profile_{o['id']}"):
+                    conn = db()
+                    try:
+                        conn.execute("UPDATE public.user_profiles SET is_active=? WHERE owner_id=?",
+                                     (not enabled, o['id']))
+                        conn.commit()
+                    finally:
+                        conn.close()
+                    st.rerun()
+                if enabled:
+                    with st.expander("Enviar enlace para crear o recuperar contraseña"):
+                        st.caption("Supabase enviará un enlace al correo registrado. "
+                                   "No restablece la contraseña al RUT.")
+                        if st.button("Enviar enlace", key=f"reset_owner_{o['id']}"):
+                            try:
+                                acceso.send_password_recovery(o['account_email'])
+                                st.success("Solicitud enviada. El propietario debe revisar su correo.")
+                            except Exception:
+                                st.error("No se pudo enviar. Revisa SMTP y el correo registrado.")
+
+
+def page_mi_cuenta():
+    p = st.session_state['auth_profile']
+    page_section_header("Mi cuenta", "Información personal y seguridad.")
+    st.write(f"**Nombre:** {p['full_name']}")
+    st.write(f"**RUT:** {p['rut']}")
+    st.write(f"**Rol:** {'Administradora' if is_admin() else 'Propietario'}")
+    with st.form("cambiar_clave"):
+        pwd = st.text_input("Nueva contraseña (mínimo 12 caracteres)", type="password")
+        confirm = st.text_input("Repite la contraseña", type="password")
+        submit = st.form_submit_button("Cambiar mi contraseña", type="primary")
+    if submit:
+        if pwd != confirm:
+            st.error("Las contraseñas no coinciden.")
+        else:
+            try:
+                acceso.change_password(pwd)
+                st.success("Contraseña cambiada. Inicia sesión nuevamente.")
+            except Exception:
+                st.error("No se pudo cambiar la contraseña. Vuelve a iniciar sesión e inténtalo.")
 
 
 # =========================================================
@@ -3836,6 +4637,12 @@ elif st.session_state.page == "Liquidaciones":
 
 elif st.session_state.page == "Detalle":
     page_detalle()
+
+elif st.session_state.page == "Propietarios" and is_admin():
+    page_propietarios()
+
+elif st.session_state.page == "Mi cuenta":
+    page_mi_cuenta()
 
 else:
     st.session_state.page = "Inicio"
