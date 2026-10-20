@@ -81,22 +81,48 @@ def sign_in(rut, password, lookup_email_and_profile, complete_invite):
         print("LOGIN_DIAG: PERFIL_INACTIVO", flush=True)
         raise ValueError("Credenciales incorrectas o cuenta no habilitada.")
 
+    stage = "CREAR_CLIENTE"
     try:
-        response = public_client().auth.sign_in_with_password({
+        client = public_client()
+        stage = "OBTENER_AUTH"
+        auth = client.auth
+        stage = "ENVIAR_AUTENTICACION"
+        response = auth.sign_in_with_password({
             "email": profile["login_email"], "password": password,
         })
     except Exception as exc:
-        # Nunca escribir RUT, email, contraseña, claves ni contenido de errores
-        # externos en los logs. Solo la clase y metadatos acotados.
+        # Diagnóstico para logs del servidor. Nunca imprime credenciales,
+        # URLs privadas, correos ni el mensaje libre de la excepción.
+        import traceback
+        import importlib.metadata
+        import sys
         code = getattr(exc, "code", None)
         code = str(code) if code is not None else "SIN_CODIGO"
         if not re.fullmatch(r"[A-Za-z0-9_-]{1,60}", code):
             code = "NO_DISPONIBLE"
         status = getattr(exc, "status", None)
         status = str(status) if isinstance(status, int) else "SIN_ESTADO"
+        attribute = getattr(exc, "name", None)
+        if not isinstance(attribute, str) or not re.fullmatch(r"[A-Za-z0-9_]{1,60}", attribute):
+            attribute = "SIN_ATRIBUTO"
+        frames = traceback.extract_tb(exc.__traceback__)
+        last = frames[-1] if frames else None
+        origin = "NO_DISPONIBLE"
+        if last is not None:
+            filename = os.path.basename(last.filename)
+            function = last.name
+            if re.fullmatch(r"[A-Za-z0-9_.-]{1,90}", filename) and re.fullmatch(r"[A-Za-z0-9_<>]{1,90}", function):
+                origin = f"{filename}:{last.lineno}:{function}"
+        try:
+            sdk = importlib.metadata.version("supabase")
+        except importlib.metadata.PackageNotFoundError:
+            sdk = "NO_DISPONIBLE"
         print(
-            f"LOGIN_DIAG: AUTH_ERROR tipo={type(exc).__name__} "
-            f"codigo={code} estado={status}", flush=True,
+            f"LOGIN_DIAG: AUTH_ERROR etapa={stage} tipo={type(exc).__name__} "
+            f"atributo={attribute} origen={origin} "
+            f"codigo={code} estado={status} "
+            f"python={sys.version_info.major}.{sys.version_info.minor} supabase={sdk}",
+            flush=True,
         )
         raise ValueError("Credenciales incorrectas o cuenta no habilitada.") from None
 
