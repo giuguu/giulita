@@ -8,6 +8,7 @@ import re
 import socket
 import ssl
 import time
+from urllib.parse import urlsplit
 import httpx
 import streamlit as st
 from supabase import create_client
@@ -75,25 +76,46 @@ def _network_error_category(exc):
 
 
 def _probe_auth_health():
-    """Comprueba solo el endpoint público de salud, sin credenciales de usuario."""
+    """Diagnóstico servidor: resolución directa y HTTPX con/sin proxy externo.
+
+    No imprime ni devuelve direcciones privadas, tokens o credenciales.
+    Se ejecuta solo cuando ya falló una petición al servicio Auth.
+    """
     base_url = secret("SUPABASE_URL").strip().rstrip("/")
     publishable_key = secret("SUPABASE_PUBLISHABLE_KEY")
-    if not base_url.startswith("https://") or not publishable_key:
+    host = urlsplit(base_url).hostname
+    if not host or not base_url.startswith("https://") or not publishable_key:
         return "CONFIGURACION_INCOMPLETA"
+
     try:
-        response = httpx.get(
-            base_url + "/auth/v1/health",
-            headers={"apikey": publishable_key},
-            timeout=8.0,
-        )
-        return f"HTTP_{response.status_code}"
-    except httpx.ConnectError as exc:
-        category, classes = _network_error_category(exc)
-        return f"CONNECT_ERROR_{category} ({classes})"
-    except httpx.TimeoutException:
-        return "TIEMPO_AGOTADO"
+        socket.getaddrinfo(host, 443, type=socket.SOCK_STREAM)
+        dns_result = "OK"
+    except socket.gaierror as exc:
+        dns_result = f"ERROR_{exc.errno}"
     except Exception as exc:
-        return f"OTRO_{type(exc).__name__}"
+        dns_result = f"ERROR_{type(exc).__name__}"
+
+    def health(trust_env):
+        try:
+            response = httpx.get(
+                base_url + "/auth/v1/health",
+                headers={"apikey": publishable_key},
+                timeout=7.0,
+                trust_env=trust_env,
+            )
+            return f"HTTP_{response.status_code}"
+        except httpx.ConnectError as exc:
+            category, _ = _network_error_category(exc)
+            return f"CONNECT_{category}"
+        except httpx.TimeoutException:
+            return "TIMEOUT"
+        except Exception as exc:
+            return f"ERROR_{type(exc).__name__}"
+
+    return (
+        f"DNS_SOCKET={dns_result} "
+        f"HTTPX_ENV={health(True)} HTTPX_DIRECTO={health(False)}"
+    )
 
 
 def clear_session():
