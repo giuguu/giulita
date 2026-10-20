@@ -1697,8 +1697,10 @@ def page_login():
             if sent:
                 try:
                     acceso.sign_in(rut, pwd, _profile_by_rut, _finish_first_access)
-                except Exception:
-                    st.error("RUT o contraseña incorrectos, o cuenta todavía no activada.")
+                except Exception as error:
+                    st.error(
+                        f"Error al iniciar sesión. Tipo: {type(error).__name__}" 
+                    )
                 else:
                     st.session_state.page = "Inicio"
                     st.rerun()
