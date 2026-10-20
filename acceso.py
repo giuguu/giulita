@@ -7,6 +7,7 @@ import os
 import re
 import streamlit as st
 from supabase import create_client
+from supabase.lib.client_options import ClientOptions
 
 
 def secret(name):
@@ -33,7 +34,9 @@ def _client(key):
     url = secret("SUPABASE_URL")
     if not url or not key:
         raise RuntimeError("Configura SUPABASE_URL y las claves en Secrets.")
-    return create_client(url, key)
+    return create_client(url, key, options=ClientOptions(
+        auto_refresh_token=False, persist_session=False,
+    ))
 
 
 def public_client():
@@ -53,37 +56,77 @@ def clear_session():
 
 
 def sign_in(rut, password, lookup_email_and_profile, complete_invite):
-    """Solo activa una cuenta invitada tras Auth exitoso con contraseña propia."""
-    rut = normalize_rut(rut)
-    profile = lookup_email_and_profile(rut)
-    if not profile or not profile.get("is_active"):
+    """Autentica el RUT; registra etapas técnicas sin divulgar datos privados.
+
+    Los mensajes LOGIN_DIAG se escriben SOLO en los logs del servidor Streamlit.
+    El navegador sigue mostrando errores genéricos de autenticación.
+    Estos diagnósticos son temporales y se pueden retirar tras la reparación.
+    """
+    try:
+        rut = normalize_rut(rut)
+    except ValueError:
+        print("LOGIN_DIAG: RUT_FORMATO_INVALIDO", flush=True)
+        raise
+
+    try:
+        profile = lookup_email_and_profile(rut)
+    except Exception as exc:
+        print(f"LOGIN_DIAG: ERROR_CONSULTA_PERFIL tipo={type(exc).__name__}", flush=True)
+        raise ValueError("No se pudo verificar el acceso.") from None
+
+    if not profile:
+        print("LOGIN_DIAG: PERFIL_NO_ENCONTRADO", flush=True)
         raise ValueError("Credenciales incorrectas o cuenta no habilitada.")
+    if not profile.get("is_active"):
+        print("LOGIN_DIAG: PERFIL_INACTIVO", flush=True)
+        raise ValueError("Credenciales incorrectas o cuenta no habilitada.")
+
     try:
         response = public_client().auth.sign_in_with_password({
             "email": profile["login_email"], "password": password,
         })
-    except Exception:
+    except Exception as exc:
+        # Nunca escribir RUT, email, contraseña, claves ni contenido de errores
+        # externos en los logs. Solo la clase y metadatos acotados.
+        code = getattr(exc, "code", None)
+        code = str(code) if code is not None else "SIN_CODIGO"
+        if not re.fullmatch(r"[A-Za-z0-9_-]{1,60}", code):
+            code = "NO_DISPONIBLE"
+        status = getattr(exc, "status", None)
+        status = str(status) if isinstance(status, int) else "SIN_ESTADO"
+        print(
+            f"LOGIN_DIAG: AUTH_ERROR tipo={type(exc).__name__} "
+            f"codigo={code} estado={status}", flush=True,
+        )
         raise ValueError("Credenciales incorrectas o cuenta no habilitada.") from None
-    if (not response.user or not response.session or
-            str(response.user.id) != str(profile["user_id"])):
+
+    if not response.user or not response.session:
+        print("LOGIN_DIAG: AUTH_SIN_SESION", flush=True)
+        raise ValueError("Cuenta no habilitada.")
+    if str(response.user.id) != str(profile["user_id"]):
+        print("LOGIN_DIAG: AUTH_USUARIO_NO_COINCIDE_PERFIL", flush=True)
         raise ValueError("Cuenta no habilitada.")
 
     if profile.get("must_change_password"):
-        # Invitaciones nuevas no tienen contraseña hasta haber aceptado el
-        # correo y escogido una de >=12 caracteres. Este paso evita acceso
-        # de cuentas antiguas cuya clave inicial era el RUT.
         if (len(password) < 12 or password == rut.split("-")[0] or
                 not getattr(response.user, "email_confirmed_at", None)):
+            print("LOGIN_DIAG: INVITACION_PENDIENTE", flush=True)
             raise ValueError("Completa primero la invitación recibida por correo.")
-        complete_invite(str(response.user.id))
-        profile = lookup_email_and_profile(rut)
+        try:
+            complete_invite(str(response.user.id))
+            profile = lookup_email_and_profile(rut)
+        except Exception as exc:
+            print(f"LOGIN_DIAG: ERROR_FINALIZAR_INVITACION tipo={type(exc).__name__}", flush=True)
+            raise ValueError("No se pudo finalizar la activación.") from None
         if not profile or profile.get("must_change_password"):
+            print("LOGIN_DIAG: INVITACION_NO_FINALIZADA", flush=True)
             raise ValueError("No se pudo finalizar la activación.")
 
     st.session_state.auth_access = response.session.access_token
     st.session_state.auth_refresh = response.session.refresh_token
     st.session_state.auth_uid = str(response.user.id)
     st.session_state.auth_profile = dict(profile)
+    print("LOGIN_DIAG: AUTENTICACION_CORRECTA", flush=True)
     return True
 
 
