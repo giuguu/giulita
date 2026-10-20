@@ -5,6 +5,10 @@ confirmada por correo les permite escogerla. El correo no aparece en login.
 """
 import os
 import re
+import socket
+import ssl
+import time
+import httpx
 import streamlit as st
 from supabase import create_client
 
@@ -47,6 +51,51 @@ def admin_client():
     return _client(secret("SUPABASE_SERVICE_ROLE_KEY"))
 
 
+
+def _network_error_category(exc):
+    """Clasifica el fallo sin imprimir host, correos, tokens ni contraseñas."""
+    current = exc
+    classes = []
+    seen = set()
+    for _ in range(8):
+        if current is None or id(current) in seen:
+            break
+        seen.add(id(current))
+        classes.append(type(current).__name__)
+        if isinstance(current, (ssl.SSLError, ssl.SSLCertVerificationError)):
+            return "TLS_CERTIFICADO", ">".join(classes)
+        if isinstance(current, socket.gaierror):
+            return "DNS", ">".join(classes)
+        if isinstance(current, (ConnectionRefusedError, ConnectionResetError)):
+            return "CONEXION_RECHAZADA", ">".join(classes)
+        if isinstance(current, TimeoutError):
+            return "TIEMPO_AGOTADO", ">".join(classes)
+        current = current.__cause__ or current.__context__
+    return "CONEXION_NO_CLASIFICADA", ">".join(classes)
+
+
+def _probe_auth_health():
+    """Comprueba solo el endpoint público de salud, sin credenciales de usuario."""
+    base_url = secret("SUPABASE_URL").strip().rstrip("/")
+    publishable_key = secret("SUPABASE_PUBLISHABLE_KEY")
+    if not base_url.startswith("https://") or not publishable_key:
+        return "CONFIGURACION_INCOMPLETA"
+    try:
+        response = httpx.get(
+            base_url + "/auth/v1/health",
+            headers={"apikey": publishable_key},
+            timeout=8.0,
+        )
+        return f"HTTP_{response.status_code}"
+    except httpx.ConnectError as exc:
+        category, classes = _network_error_category(exc)
+        return f"CONNECT_ERROR_{category} ({classes})"
+    except httpx.TimeoutException:
+        return "TIEMPO_AGOTADO"
+    except Exception as exc:
+        return f"OTRO_{type(exc).__name__}"
+
+
 def clear_session():
     for key in ("auth_access", "auth_refresh", "auth_profile", "auth_uid",
                 "pending_first_login", "reservation_review", "selected_reservation"):
@@ -86,9 +135,17 @@ def sign_in(rut, password, lookup_email_and_profile, complete_invite):
         stage = "OBTENER_AUTH"
         auth = client.auth
         stage = "ENVIAR_AUTENTICACION"
-        response = auth.sign_in_with_password({
-            "email": profile["login_email"], "password": password,
-        })
+        # Solo reintentar una vez los errores de transporte transitorios.
+        for attempt in range(2):
+            try:
+                response = auth.sign_in_with_password({
+                    "email": profile["login_email"], "password": password,
+                })
+                break
+            except httpx.ConnectError:
+                if attempt == 1:
+                    raise
+                time.sleep(1)
     except Exception as exc:
         # Diagnóstico para logs del servidor. Nunca imprime credenciales,
         # URLs privadas, correos ni el mensaje libre de la excepción.
@@ -116,6 +173,14 @@ def sign_in(rut, password, lookup_email_and_profile, complete_invite):
             sdk = importlib.metadata.version("supabase")
         except importlib.metadata.PackageNotFoundError:
             sdk = "NO_DISPONIBLE"
+        if isinstance(exc, httpx.ConnectError):
+            category, classes = _network_error_category(exc)
+            health_status = _probe_auth_health()
+            print(
+                f"LOGIN_DIAG: RED categoria={category} cadena={classes} "
+                f"auth_health={health_status}",
+                flush=True,
+            )
         print(
             f"LOGIN_DIAG: AUTH_ERROR etapa={stage} tipo={type(exc).__name__} "
             f"atributo={attribute} origen={origin} "
