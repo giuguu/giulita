@@ -1697,10 +1697,10 @@ def page_login():
             if sent:
                 try:
                     acceso.sign_in(rut, pwd, _profile_by_rut, _finish_first_access)
+                except ValueError as error:
+                    st.error(f"Diagnóstico de acceso: {error}")
                 except Exception as error:
-                    st.error(
-                        f"Error al iniciar sesión. Tipo: {type(error).__name__}" 
-                    )
+                    st.error(f"Error técnico: {type(error).__name__}")
                 else:
                     st.session_state.page = "Inicio"
                     st.rerun()
