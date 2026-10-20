@@ -7,7 +7,6 @@ import os
 import re
 import streamlit as st
 from supabase import create_client
-from supabase.lib.client_options import ClientOptions
 
 
 def secret(name):
@@ -34,9 +33,9 @@ def _client(key):
     url = secret("SUPABASE_URL")
     if not url or not key:
         raise RuntimeError("Configura SUPABASE_URL y las claves en Secrets.")
-    return create_client(url, key, options=ClientOptions(
-        auto_refresh_token=False, persist_session=False,
-    ))
+    # Crear un cliente independiente por petición, sin ClientOptions.
+    # Evita AttributeError: storage en algunas versiones del SDK Supabase.
+    return create_client(url, key)
 
 
 def public_client():
