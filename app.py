@@ -12,8 +12,7 @@ from datetime import date, datetime, timedelta
 from calendar import monthrange
 from pathlib import Path
 from psycopg2 import errors as pg_errors
-import acceso
-import activacion
+import re
 
 # =========================================================
 # CONFIGURACIÓN
@@ -1504,240 +1503,65 @@ def init_db():
 init_db()
 
 # =========================================================
-# CONTROL DE ACCESO · RUT + CONTRASEÑA
+# MODO SIN LOGIN — USO PRIVADO EXCLUSIVAMENTE
 # =========================================================
-
-def _profile_by_rut(rut):
-    conn = db(admin=True)
-    try:
-        row = conn.execute("""
-            SELECT user_id, rut, full_name, login_email, role, owner_id,
-                   is_active, must_change_password
-            FROM public.user_profiles WHERE rut=?
-        """, (rut,)).fetchone()
-        return dict(row) if row else None
-    finally:
-        conn.close()
-
-
-def _profile_by_uid(uid):
-    conn = db(admin=True)
-    try:
-        row = conn.execute("""
-            SELECT user_id, rut, full_name, login_email, role, owner_id,
-                   is_active, must_change_password
-            FROM public.user_profiles WHERE user_id=?::uuid
-        """, (uid,)).fetchone()
-        return dict(row) if row else None
-    finally:
-        conn.close()
+# ADVERTENCIA: toda persona con acceso a esta aplicación podrá actuar como
+# administrador. Antes de publicarla, restringir su acceso en Streamlit Cloud:
+# Settings -> Sharing -> Only specific people can view this app.
+# No se realizan llamadas a Supabase Auth.
 
 
 def current_role():
-    profile = st.session_state.get("auth_profile") or {}
-    return profile.get("role")
+    return "admin"
 
 
 def is_admin():
-    return current_role() == "admin"
+    return True
 
 
-def _finish_first_access(uid):
-    """Marca la invitación completada tras autenticar con una contraseña personal."""
+def normalizar_rut(valor):
+    """Valida el RUT al registrar un propietario; no autentica usuarios."""
+    limpio = re.sub(r"[^0-9kK]", "", str(valor)).upper()
+    if not re.fullmatch(r"[0-9]{1,8}[0-9K]", limpio):
+        raise ValueError("Ingresa un RUT válido.")
+    numero, dv = str(int(limpio[:-1])), limpio[-1]
+    factores = (2, 3, 4, 5, 6, 7)
+    total = sum(int(digito) * factores[i % 6]
+                for i, digito in enumerate(reversed(numero)))
+    resto = 11 - (total % 11)
+    correcto = "0" if resto == 11 else "K" if resto == 10 else str(resto)
+    if dv != correcto:
+        raise ValueError("El dígito verificador del RUT es incorrecto.")
+    return f"{numero}-{dv}"
+
+
+def _iniciar_modo_privado_sin_login():
+    """Identidad de administrador para compatibilidad con las políticas RLS existentes.
+
+    No valida identidad de visitantes. Solo es apropiado para un despliegue
+    privado con acceso restringido en Streamlit Cloud.
+    """
     conn = db(admin=True)
     try:
-        cur = conn.execute("""
-            UPDATE public.user_profiles
-            SET must_change_password = FALSE
-            WHERE user_id = ?::uuid AND is_active = TRUE
-        """, (uid,))
-        if cur.rowcount != 1:
-            raise ValueError("No se pudo completar la activación.")
-        conn.commit()
-    except Exception:
-        conn.rollback()
-        raise
+        fila = conn.execute("""
+            SELECT user_id, rut, full_name, login_email, role,
+                   owner_id, is_active, must_change_password
+            FROM public.user_profiles
+            WHERE role = 'admin' AND is_active = TRUE
+            ORDER BY user_id LIMIT 1
+        """).fetchone()
     finally:
         conn.close()
+    if not fila:
+        st.error("No se encontró un perfil administrador activo en la base de datos.")
+        st.stop()
+    perfil = dict(fila)
+    # RLS y created_by siguen usando el UUID real del administrador existente.
+    st.session_state["auth_profile"] = perfil
+    st.session_state["auth_uid"] = str(perfil["user_id"])
 
 
-def _render_login_illustration():
-    """Ilustración elegida por la usuaria o globos suaves de respaldo."""
-    with st.container(border=True):
-        st.markdown('<div class="auth-visual-anchor"></div>', unsafe_allow_html=True)
-        foto = Path(__file__).resolve().parent / "login.png"
-        if foto.is_file():
-            st.image(str(foto), use_container_width=True)
-        else:
-            st.markdown('''<div class="auth-visual-fallback" aria-label="Ilustración decorativa de globos aerostáticos">
-                <svg viewBox="0 0 440 340" xmlns="http://www.w3.org/2000/svg" aria-hidden="true">
-                    <defs>
-                        <linearGradient id="balloonA" x1="0" y1="0" x2="1" y2="1">
-                            <stop stop-color="#ff2b8b"/><stop offset="1" stop-color="#ba2675"/>
-                        </linearGradient>
-                        <linearGradient id="balloonB" x1="0" y1="0" x2="0" y2="1">
-                            <stop stop-color="#f998bc"/><stop offset="1" stop-color="#e94b8b"/>
-                        </linearGradient>
-                    </defs>
-                    <circle cx="218" cy="185" r="115" fill="#ffe7f1"/>
-                    <path d="M0 258 Q60 214 121 258 T244 250 T440 250 V340 H0Z" fill="#fff3f8"/>
-                    <path d="M0 291 Q87 241 159 298 T338 286 T440 292 V340 H0Z" fill="#fff"/>
-                    <g transform="translate(154 38)">
-                        <path d="M0 74 C-36 25 -27 -12 0 -12 C27 -12 36 25 0 74Z" fill="url(#balloonA)"/>
-                        <path d="M0 -12 C-12 -8 -16 45 0 74 C16 45 12 -8 0 -12Z" fill="#ffe1eb"/>
-                        <path d="M0 -12 C-4 -8 -5 44 0 74 C5 44 4 -8 0 -12Z" fill="#ff5b9e"/>
-                        <path d="M-10 66 L-7 84 M10 66 L7 84" stroke="#82405e" stroke-width="2"/>
-                        <rect x="-11" y="82" width="22" height="12" rx="2" fill="#89506a"/>
-                    </g>
-                    <g transform="translate(289 104) scale(.65)">
-                        <path d="M0 74 C-36 25 -27 -12 0 -12 C27 -12 36 25 0 74Z" fill="url(#balloonB)"/>
-                        <path d="M0 -12 C-12 -8 -16 45 0 74 C16 45 12 -8 0 -12Z" fill="#ffe8f1"/>
-                        <path d="M-10 66 L-7 84 M10 66 L7 84" stroke="#82405e" stroke-width="2"/>
-                        <rect x="-11" y="82" width="22" height="12" rx="2" fill="#89506a"/>
-                    </g>
-                    <g fill="#fff" opacity=".93">
-                        <circle cx="84" cy="253" r="17"/><circle cx="106" cy="244" r="26"/><circle cx="137" cy="255" r="17"/>
-                        <circle cx="328" cy="277" r="21"/><circle cx="354" cy="263" r="31"/><circle cx="390" cy="276" r="22"/>
-                    </g>
-                </svg>
-            </div>''', unsafe_allow_html=True)
-        st.markdown('<div class="auth-welcome">Tus arriendos, a tu ritmo</div>',
-                    unsafe_allow_html=True)
-        st.markdown('<div class="auth-welcome-text">Tu próxima reserva, tu calendario '
-                    'y tus propiedades, siempre a mano.</div>', unsafe_allow_html=True)
-        st.markdown('<div class="auth-mini-divider"></div>', unsafe_allow_html=True)
-
-
-def page_login():
-    """Acceso de dos etapas: bienvenida → RUT y contraseña.
-
-    Conserva las invitaciones/recuperación de cuenta y el acceso seguro por RUT.
-    """
-    # Debe mostrarse también durante la bienvenida para que los enlaces de
-    # invitación/recuperación sigan funcionando sin un inicio de sesión previo.
-    activacion.render_activation()
-    st.markdown(LOGIN_CSS, unsafe_allow_html=True)
-
-    if st.session_state.get("auth_step") not in ("welcome", "login"):
-        st.session_state["auth_step"] = "welcome"
-
-    st.markdown('<div class="auth-overline">ARRIENDOS TEMPORALES</div>',
-                unsafe_allow_html=True)
-
-    izquierda, derecha = st.columns([.96, 1.04], gap="large", vertical_alignment="center")
-
-    with izquierda:
-        _render_login_illustration()
-
-    if st.session_state["auth_step"] == "welcome":
-        with derecha:
-            with st.container(border=True):
-                st.markdown('<div class="auth-welcome-anchor"></div>', unsafe_allow_html=True)
-                st.markdown('<div class="auth-welcome-kicker">TU LUGAR PARA ORGANIZARTE</div>',
-                            unsafe_allow_html=True)
-                st.markdown('<div class="auth-welcome-headline">Bienvenido a tu espacio de arriendos</div>',
-                            unsafe_allow_html=True)
-                st.markdown("""<div class="auth-welcome-description">
-                    Tus reservas, departamentos y fechas importantes,
-                    organizados de forma sencilla en un solo lugar.
-                </div>""", unsafe_allow_html=True)
-                st.markdown("""<div class="auth-welcome-features">
-                    <strong>Todo lo que necesitas para gestionar tus arriendos:</strong><br>
-                    Reservas y calendario · Departamentos · Liquidaciones
-                </div>""", unsafe_allow_html=True)
-                if st.button("Empezar", key="auth_start", type="primary",
-                             use_container_width=True):
-                    st.session_state["auth_step"] = "login"
-                    st.rerun()
-                st.markdown('<div class="auth-access-note">Acceso exclusivo para personas autorizadas.</div>',
-                            unsafe_allow_html=True)
-        return
-
-    with derecha:
-        with st.container(border=True):
-            st.markdown('<div class="auth-form-anchor"></div>', unsafe_allow_html=True)
-            st.markdown('''<div class="auth-header-art">
-                <svg viewBox="0 0 470 167" preserveAspectRatio="xMidYMid slice"
-                     xmlns="http://www.w3.org/2000/svg" aria-hidden="true">
-                    <rect width="470" height="167" fill="#f6beda"/>
-                    <g opacity=".72">
-                        <path d="M20 -25 C-28 33 7 107 49 96 C90 85 99 22 48 -25" fill="#e97eae"/>
-                        <path d="M48 -25 C33 7 36 71 49 96 C62 71 65 7 48 -25" fill="#fce2ec"/>
-                        <path d="M29 80 L35 110 M69 80 L63 110" stroke="#a95080" stroke-width="2"/>
-                        <rect x="32" y="110" width="35" height="14" rx="3" fill="#b15b88"/>
-                    </g>
-                    <g opacity=".58" transform="translate(212 48) scale(.54)">
-                        <path d="M0 60 C-40 7 -30 -25 0 -25 C30 -25 40 7 0 60Z" fill="#db72a8"/>
-                        <path d="M0 -25 C-14 -19 -19 29 0 60 C19 29 14 -19 0 -25Z" fill="#ffeaf2"/>
-                        <path d="M-8 55 L-5 70 M8 55 L5 70" stroke="#874a72" stroke-width="3"/>
-                        <rect x="-10" y="70" width="20" height="12" rx="3" fill="#a65a86"/>
-                    </g>
-                    <path d="M-30 160 Q70 96 155 142 T354 127 T500 124 V188 H-30Z" fill="#ffeaf3"/>
-                    <path d="M-20 174 Q92 127 170 166 T362 160 T500 154 V191 H-20Z" fill="#fff8fb"/>
-                    <g fill="#fff8fb">
-                        <circle cx="382" cy="125" r="31"/><circle cx="418" cy="107" r="39"/>
-                        <circle cx="462" cy="132" r="32"/>
-                    </g>
-                </svg>
-            </div>''', unsafe_allow_html=True)
-            st.markdown('<div class="auth-form-kicker">TU CUENTA PERSONAL</div>',
-                        unsafe_allow_html=True)
-            st.markdown('<div class="auth-form-heading">Iniciar sesión</div>',
-                        unsafe_allow_html=True)
-            st.markdown('<div class="auth-form-subtitle">Ingresa con tu RUT y '
-                        'tu contraseña personal.</div>', unsafe_allow_html=True)
-
-            with st.form("rut_login"):
-                rut = st.text_input("RUT", placeholder="12.345.678-5")
-                pwd = st.text_input("Contraseña", type="password",
-                                    placeholder="Ingresa tu contraseña")
-                sent = st.form_submit_button("Iniciar sesión", type="primary",
-                                             use_container_width=True)
-
-            if sent:
-                try:
-                    acceso.sign_in(rut, pwd, _profile_by_rut, _finish_first_access)
-                except ValueError as error:
-                    st.error(f"Diagnóstico de acceso: {error}")
-                except Exception as error:
-                    st.error(f"Error técnico: {type(error).__name__}")
-                else:
-                    st.session_state.page = "Inicio"
-                    st.rerun()
-
-            with st.expander("¿Olvidaste tu contraseña?"):
-                st.caption("Solicita un enlace de recuperación al correo de tu cuenta.")
-                with st.form("password_recovery"):
-                    recovered_rut = st.text_input("Tu RUT", key="recover_rut")
-                    send_recovery = st.form_submit_button("Solicitar enlace")
-                if send_recovery:
-                    try:
-                        r = acceso.normalize_rut(recovered_rut)
-                        p = _profile_by_rut(r)
-                        if p and p.get("is_active"):
-                            acceso.send_password_recovery(p["login_email"])
-                    except Exception:
-                        pass
-                    st.info("Si tu cuenta tiene acceso habilitado, recibirás instrucciones por correo.")
-
-            st.markdown('<div class="auth-authorized">Acceso exclusivo para cuentas '
-                        'autorizadas.</div>', unsafe_allow_html=True)
-
-            if st.button("← Volver a bienvenida", key="auth_back", use_container_width=True):
-                st.session_state["auth_step"] = "welcome"
-                st.rerun()
-
-
-try:
-    _profile = acceso.current_profile(_profile_by_uid)
-except Exception:
-    st.error("No se pudo comprobar la sesión. Revisa los Secrets de Supabase Auth.")
-    st.stop()
-if _profile is None:
-    st.markdown("<style>[data-testid='stSidebar'] {display:none !important;}</style>",
-                unsafe_allow_html=True)
-    page_login()
-    st.stop()
+_iniciar_modo_privado_sin_login()
 
 # =========================================================
 # FUNCIONES
@@ -1988,7 +1812,7 @@ def get_checklist(reservation_id):
 
 def set_page(page, reservation_id=None):
     st.session_state.page = page
-    if page in ("Inicio", "Reservas", "Calendario", "Departamentos", "Liquidaciones", "Propietarios", "Mi cuenta"):
+    if page in ("Inicio", "Reservas", "Calendario", "Departamentos", "Liquidaciones", "Propietarios"):
         # Los accesos directos desde Detalle no deben volver accidentalmente a Inicio.
         st.session_state.nav_choice = page
     if reservation_id is not None:
@@ -2131,7 +1955,7 @@ if "selected_reservation" not in st.session_state:
 pages = ["Inicio", "Reservas", "Calendario", "Departamentos", "Liquidaciones"]
 if is_admin():
     pages.append("Propietarios")
-pages.append("Mi cuenta")
+
 
 with st.sidebar:
     st.markdown('<div class="brand">🌸 Arriendos</div>', unsafe_allow_html=True)
@@ -2163,13 +1987,8 @@ with st.sidebar:
 
     st.divider()
 
-    st.caption(f"{st.session_state['auth_profile']['full_name']}")
-    st.caption("Administración" if is_admin() else "Panel de propietario")
+    st.caption("Panel de administración")
     st.caption(date.today().strftime("%d/%m/%Y"))
-    if st.button("Cerrar sesión", use_container_width=True):
-        acceso.clear_session()
-        st.session_state["auth_step"] = "welcome"
-        st.rerun()
 
 # =========================================================
 # INICIO
@@ -4468,36 +4287,27 @@ def page_liquidaciones():
 # =========================================================
 
 def admin_owners():
-    if not is_admin():
-        raise PermissionError("Sin permiso")
     conn = db()
     try:
-        return [dict(r) for r in conn.execute("""
-            SELECT o.*, p.user_id, p.is_active AS login_active,
-                   p.login_email AS account_email, p.must_change_password AS invitation_pending
-            FROM public.owners o LEFT JOIN public.user_profiles p ON p.owner_id=o.id
-            ORDER BY o.full_name
+        return [dict(fila) for fila in conn.execute("""
+            SELECT * FROM public.owners ORDER BY full_name
         """).fetchall()]
     finally:
         conn.close()
 
 
 def page_propietarios():
-    if not is_admin():
-        st.stop()
-    page_section_header("Propietarios", "Registra propietarios y autoriza el acceso por RUT.")
-    st.caption("Tener un RUT registrado no habilita el acceso. Debe existir una cuenta Auth activa.")
-
+    page_section_header("Propietarios", "Registra propietarios y vincula sus departamentos.")
     with st.expander("＋ Registrar propietario", expanded=False):
         with st.form("form_nuevo_propietario", clear_on_submit=True):
             rut_input = st.text_input("RUT del propietario")
             nombre = st.text_input("Nombre completo")
             telefono = st.text_input("Teléfono (opcional)")
-            email = st.text_input("Correo real para la cuenta y recuperación (opcional al registrar)")
+            email = st.text_input("Correo de contacto (opcional)")
             submit = st.form_submit_button("Guardar propietario", type="primary")
         if submit:
             try:
-                rut = acceso.normalize_rut(rut_input)
+                rut = normalizar_rut(rut_input)
                 if not nombre.strip():
                     raise ValueError("Ingresa el nombre del propietario.")
                 conn = db()
@@ -4509,113 +4319,25 @@ def page_propietarios():
                     conn.commit()
                 finally:
                     conn.close()
-                st.success("Propietario registrado. Ahora puedes vincular sus departamentos.")
+                st.success("Propietario registrado. Puedes vincularlo desde Departamentos.")
                 st.rerun()
             except psycopg2.errors.UniqueViolation:
                 st.error("Ese RUT ya está registrado.")
-            except Exception as exc:
-                st.error(f"No se pudo registrar al propietario: {exc}")
+            except Exception as error:
+                st.error(f"No se pudo registrar al propietario: {error}")
 
-    owners = admin_owners()
-    if not owners:
-        st.info("Todavía no hay propietarios.")
+    propietarios = admin_owners()
+    if not propietarios:
+        st.info("Todavía no hay propietarios registrados.")
         return
-    depts = get_departments()
-    for o in owners:
+    departamentos = get_departments()
+    for propietario in propietarios:
         with st.container(border=True):
-            left, right = st.columns([2, 2])
-            with left:
-                st.markdown(f"**{html_escape(o['full_name'])}**")
-                st.caption(f"RUT: {o['rut']} · {o['phone'] or 'Sin teléfono'}")
-            with right:
-                st.caption("Invitación pendiente" if o.get("user_id") and o.get("invitation_pending")
-                           else "Acceso activo" if o.get("user_id") and o.get("login_active")
-                           else "Sin acceso" if not o.get("user_id") else "Acceso deshabilitado")
-                dep_count = sum(int(d['owner_id']==o['id']) for d in depts)
-                st.caption(f"Departamentos asociados: {dep_count}")
-            if not o.get("user_id"):
-                with st.expander("Enviar invitación de acceso"):
-                    st.info("El propietario recibirá un enlace para crear una contraseña personal. "
-                            "No se utilizará su RUT como contraseña.")
-                    with st.form(f"activar_{o['id']}"):
-                        real_email = st.text_input("Correo del propietario", value=o['email'] or "",
-                                                   key=f"mail_owner_{o['id']}")
-                        verified = st.checkbox("Confirmo que el correo pertenece al propietario",
-                                               key=f"checked_email_owner_{o['id']}")
-                        activate = st.form_submit_button("Enviar invitación", type="primary")
-                    if activate:
-                        if not verified or '@' not in real_email:
-                            st.error("Verifica el correo del propietario.")
-                        else:
-                            auth_uid = None
-                            try:
-                                auth_uid = acceso.invite_owner(real_email, o['full_name'])
-                                conn = db()
-                                try:
-                                    conn.execute("""
-                                        INSERT INTO public.user_profiles
-                                        (user_id, rut, full_name, login_email, role, owner_id,
-                                         is_active, must_change_password)
-                                        VALUES (?::uuid, ?, ?, ?, 'owner', ?, true, true)
-                                    """, (auth_uid, o['rut'], o['full_name'], real_email.strip().lower(), o['id']))
-                                    conn.execute("UPDATE public.owners SET email=? WHERE id=?",
-                                                 (real_email.strip().lower(), o['id']))
-                                    conn.commit()
-                                finally:
-                                    conn.close()
-                                st.success("Invitación solicitada. El propietario debe abrir el enlace "
-                                           "del correo, crear una contraseña y luego ingresar con su RUT.")
-                            except Exception:
-                                if auth_uid:
-                                    try:
-                                        acceso.delete_auth_user(auth_uid)
-                                    except Exception:
-                                        pass
-                                st.error("No se pudo enviar la invitación. Verifica el correo, "
-                                         "la configuración SMTP y la URL pública de la app.")
-            else:
-                enabled = bool(o.get("login_active"))
-                if st.button("Deshabilitar acceso" if enabled else "Habilitar acceso",
-                             key=f"toggle_profile_{o['id']}"):
-                    conn = db()
-                    try:
-                        conn.execute("UPDATE public.user_profiles SET is_active=? WHERE owner_id=?",
-                                     (not enabled, o['id']))
-                        conn.commit()
-                    finally:
-                        conn.close()
-                    st.rerun()
-                if enabled:
-                    with st.expander("Enviar enlace para crear o recuperar contraseña"):
-                        st.caption("Supabase enviará un enlace al correo registrado. "
-                                   "No restablece la contraseña al RUT.")
-                        if st.button("Enviar enlace", key=f"reset_owner_{o['id']}"):
-                            try:
-                                acceso.send_password_recovery(o['account_email'])
-                                st.success("Solicitud enviada. El propietario debe revisar su correo.")
-                            except Exception:
-                                st.error("No se pudo enviar. Revisa SMTP y el correo registrado.")
-
-
-def page_mi_cuenta():
-    p = st.session_state['auth_profile']
-    page_section_header("Mi cuenta", "Información personal y seguridad.")
-    st.write(f"**Nombre:** {p['full_name']}")
-    st.write(f"**RUT:** {p['rut']}")
-    st.write(f"**Rol:** {'Administradora' if is_admin() else 'Propietario'}")
-    with st.form("cambiar_clave"):
-        pwd = st.text_input("Nueva contraseña (mínimo 12 caracteres)", type="password")
-        confirm = st.text_input("Repite la contraseña", type="password")
-        submit = st.form_submit_button("Cambiar mi contraseña", type="primary")
-    if submit:
-        if pwd != confirm:
-            st.error("Las contraseñas no coinciden.")
-        else:
-            try:
-                acceso.change_password(pwd)
-                st.success("Contraseña cambiada. Inicia sesión nuevamente.")
-            except Exception:
-                st.error("No se pudo cambiar la contraseña. Vuelve a iniciar sesión e inténtalo.")
+            st.markdown(f"**{html_escape(str(propietario['full_name']))}**")
+            st.caption(f"RUT: {html_escape(str(propietario['rut']))} · "
+                       f"Teléfono: {html_escape(str(propietario['phone'] or 'Sin teléfono'))}")
+            cantidad = sum(d.get('owner_id') == propietario['id'] for d in departamentos)
+            st.caption(f"Departamentos asociados: {cantidad}")
 
 
 # =========================================================
@@ -4642,9 +4364,6 @@ elif st.session_state.page == "Detalle":
 
 elif st.session_state.page == "Propietarios" and is_admin():
     page_propietarios()
-
-elif st.session_state.page == "Mi cuenta":
-    page_mi_cuenta()
 
 else:
     st.session_state.page = "Inicio"
