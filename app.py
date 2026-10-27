@@ -1,4 +1,6 @@
 import streamlit as st
+import altair as alt
+import pandas as pd
 import os
 import psycopg2
 from psycopg2.extras import DictCursor
@@ -6,13 +8,23 @@ from psycopg2.pool import ThreadedConnectionPool
 import base64
 import unicodedata
 import json
-from io import BytesIO
+import csv
+from io import BytesIO, StringIO
+from collections import defaultdict
 from html import escape as html_escape
 from datetime import date, datetime, timedelta
 from calendar import monthrange
 from pathlib import Path
-from psycopg2 import errors as pg_errors
-import re
+from zoneinfo import ZoneInfo
+from contextlib import contextmanager
+
+from logic import (
+    calculate_owner_liquidation,
+    format_clp,
+    money,
+    payment_status,
+    season_price_for,
+)
 
 # =========================================================
 # CONFIGURACIÓN
@@ -42,6 +54,30 @@ ORANGE = "#C77700"
 ORANGE_BG = "#FFF4DD"
 RED = "#C83D56"
 RED_BG = "#FDECEF"
+
+# Zona horaria oficial del negocio (Chile continental).
+TZ_CL = ZoneInfo("America/Santiago")
+
+
+def now_cl():
+    """Fecha y hora actual en Chile, sin depender de la zona del servidor."""
+    return datetime.now(TZ_CL)
+
+
+def today_cl():
+    return now_cl().date()
+
+
+def esc(value):
+    """Escapa texto dinámico antes de insertarlo en HTML."""
+    return html_escape("" if value is None else str(value))
+
+
+STATUS_NO_DEPOSIT = "Sin abono"
+STATUS_PARTIAL = "Abono recibido"
+STATUS_PAID = "Pagado completamente"
+STATUS_CANCELLED = "Cancelada"
+STATUSES = (STATUS_NO_DEPOSIT, STATUS_PARTIAL, STATUS_PAID, STATUS_CANCELLED)
 
 # =========================================================
 # ESTILOS
@@ -433,6 +469,14 @@ st.markdown(
         font-weight: 750;
     }}
 
+    .availability-blocked {{
+        color: {ORANGE};
+        background: {ORANGE_BG};
+        border-radius: 10px;
+        padding: 8px 12px;
+        font-weight: 750;
+    }}
+
     .calendar-day {{
         background: {WHITE};
         border: 1px solid #EEE6EC;
@@ -445,6 +489,11 @@ st.markdown(
     .calendar-day.busy {{
         background: {PINK_LIGHT};
         border-color: {PINK_BORDER};
+    }}
+
+    .calendar-day.blocked {{
+        background: {ORANGE_BG};
+        border-color: #F3D9A6;
     }}
 
     .calendar-day-number {{
@@ -473,27 +522,16 @@ st.markdown(
         background: {PINK_LIGHT};
     }}
 
-    div.stButton > button[kind="primary"],
-    [data-testid="stFormSubmitButton"] button[kind="primaryFormSubmit"],
-    [data-testid="stFormSubmitButton"] button[kind="primary"] {{
-        background: {FUCHSIA_DARK} !important;
-        border-color: {FUCHSIA_DARK} !important;
-        color: #FFFFFF !important;
+    div.stButton > button[kind="primary"] {{
+        background: {FUCHSIA};
+        border-color: {FUCHSIA};
+        color: white;
     }}
 
-    div.stButton > button[kind="primary"]:hover,
-    [data-testid="stFormSubmitButton"] button[kind="primaryFormSubmit"]:hover,
-    [data-testid="stFormSubmitButton"] button[kind="primary"]:hover {{
-        background: #9C255F !important;
-        border-color: #9C255F !important;
-        color: #FFFFFF !important;
-    }}
-
-    div.stButton > button[kind="primary"] *,
-    [data-testid="stFormSubmitButton"] button[kind="primaryFormSubmit"] *,
-    [data-testid="stFormSubmitButton"] button[kind="primary"] * {{
-        color: #FFFFFF !important;
-        -webkit-text-fill-color: #FFFFFF !important;
+    div.stButton > button[kind="primary"]:hover {{
+        background: {FUCHSIA_DARK};
+        border-color: {FUCHSIA_DARK};
+        color: white;
     }}
 
     /* =========================
@@ -591,6 +629,11 @@ st.markdown(
         border-color: {PINK_BORDER};
     }}
 
+    .calendar-day.blocked {{
+        background: {ORANGE_BG};
+        border-color: #F3D9A6;
+    }}
+
     .calendar-day-number {{
         font-weight: 800;
         color: {TEXT};
@@ -606,6 +649,7 @@ st.markdown(
 
     .calendar-status.free {{ color: {GREEN}; }}
     .calendar-status.busy {{ color: {RED}; }}
+    .calendar-status.blocked {{ color: {ORANGE}; }}
 
     @media (max-width: 768px) {{
         .main-title {{ font-size: 1.8rem; }}
@@ -657,7 +701,7 @@ st.markdown(
 
     .payment-summary {{
         display: grid;
-        grid-template-columns: repeat(3, minmax(0, 1fr));
+        grid-template-columns: repeat(auto-fit, minmax(145px, 1fr));
         gap: 12px;
         margin: 0 0 10px 0;
     }}
@@ -855,267 +899,154 @@ st.markdown(
         text-align: center;
         margin-top: 2rem;
     }}
+
+    /* ---------- Ajustes visuales modernos ---------- */
+    html, body, [class*="css"], .stApp {{
+        font-family: "Inter", "Segoe UI", system-ui, -apple-system, sans-serif;
+    }}
+
+    .metric-card, .payment-card, .detail-box, .reservation-card {{
+        transition: transform .16s ease, box-shadow .16s ease;
+    }}
+
+    .metric-card:hover, .payment-card:hover, .reservation-card:hover {{
+        transform: translateY(-2px);
+        box-shadow: 0 10px 26px rgba(217,70,141,0.10);
+    }}
+
+    .payment-card {{
+        background: linear-gradient(180deg, {WHITE} 0%, {PINK_SOFT} 100%);
+    }}
+
+    .section-title {{
+        border-left: 4px solid {FUCHSIA};
+        padding-left: 10px;
+        line-height: 1.25;
+    }}
+
+    div[data-testid="stButton"] > button {{
+        border-radius: 11px;
+        font-weight: 650;
+        transition: transform .12s ease, box-shadow .12s ease, background .12s ease;
+    }}
+
+    div[data-testid="stButton"] > button:hover {{
+        transform: translateY(-1px);
+        box-shadow: 0 6px 16px rgba(217,70,141,.16);
+    }}
+
+    div[data-testid="stTextInput"] input,
+    div[data-testid="stNumberInput"] input,
+    div[data-testid="stDateInput"] input,
+    textarea {{
+        border-radius: 10px !important;
+    }}
+
+    div[data-testid="stTextInput"] input:focus,
+    div[data-testid="stNumberInput"] input:focus,
+    div[data-testid="stDateInput"] input:focus,
+    textarea:focus {{
+        border-color: {FUCHSIA} !important;
+        box-shadow: 0 0 0 3px rgba(217,70,141,.14) !important;
+    }}
+
+    [data-testid="stSidebar"] .stRadio label {{
+        border-radius: 10px;
+        padding: 4px 8px;
+        transition: background .12s ease;
+    }}
+
+    [data-testid="stSidebar"] .stRadio label:hover {{
+        background: {PINK_LIGHT};
+    }}
+
+    .payment-row.voided {{
+        opacity: .6;
+        text-decoration: line-through;
+    }}
+
+    .status-pill {{
+        display: inline-block;
+        border-radius: 999px;
+        padding: 4px 10px;
+        font-size: .76rem;
+        font-weight: 800;
+        background: {PINK_LIGHT};
+        color: {FUCHSIA_DARK};
+        border: 1px solid {PINK_BORDER};
+    }}
+
+    .status-pill.ok {{
+        background: {GREEN_BG};
+        color: {GREEN};
+        border-color: #BDE8D5;
+    }}
+
+    .status-pill.warn {{
+        background: {ORANGE_BG};
+        color: {ORANGE};
+        border-color: #F3D9A6;
+    }}
+
+    .status-pill.danger {{
+        background: {RED_BG};
+        color: {RED};
+        border-color: #F3C4CD;
+    }}
+
+    .owner-card {{
+        background: {WHITE};
+        border: 1px solid {PINK_BORDER};
+        border-radius: 16px;
+        padding: 16px 18px;
+        margin-bottom: 10px;
+    }}
+
+    .report-table-wrap {{
+        overflow-x: auto;
+        border: 1px solid {PINK_BORDER};
+        border-radius: 14px;
+        margin: 6px 0 14px;
+        background: {WHITE};
+    }}
+
+    .report-table {{
+        width: 100%;
+        border-collapse: collapse;
+        font-size: .9rem;
+    }}
+
+    .report-table thead th {{
+        background: linear-gradient(135deg, {FUCHSIA} 0%, {FUCHSIA_DARK} 100%);
+        color: {WHITE};
+        font-weight: 700;
+        text-align: left;
+        padding: 10px 14px;
+        white-space: nowrap;
+    }}
+
+    .report-table tbody td {{
+        padding: 9px 14px;
+        border-top: 1px solid {PINK_BORDER};
+        color: {TEXT};
+        white-space: nowrap;
+    }}
+
+    .report-table tbody tr:nth-child(even) {{
+        background: {PINK_SOFT};
+    }}
+
+    .report-table tbody tr:hover {{
+        background: {PINK_LIGHT};
+    }}
+
+    .report-table tbody tr:last-child td {{
+        border-bottom: none;
+    }}
     </style>
     """,
     unsafe_allow_html=True,
 )
-
-# =========================================================
-# DISEÑO DEL LOGIN (pantalla dividida, foto personalizable)
-# =========================================================
-
-LOGIN_CSS = """
-<style>
-/* Pantallas públicas: colores suaves, texto legible y botones rosados. */
-[data-testid="stSidebar"] { display: none !important; }
-[data-testid="stHeader"] { background: transparent !important; }
-[data-testid="stDecoration"] { display: none !important; }
-.stApp {
-    background:
-      radial-gradient(ellipse at 7% 10%, rgba(250, 196, 224, .33), transparent 37%),
-      radial-gradient(ellipse at 94% 90%, rgba(213, 204, 245, .30), transparent 40%),
-      linear-gradient(135deg, #fffafd 0%, #fbedf5 52%, #f3edf9 100%) !important;
-    color: #3c2d3d !important;
-    min-height: 100vh;
-}
-[data-testid="stMainBlockContainer"] {
-    max-width: 1120px !important;
-    padding-top: clamp(1.4rem, 4vh, 3.4rem) !important;
-    padding-bottom: 3.5rem !important;
-}
-.auth-overline {
-    text-align: center;
-    font-size: .77rem;
-    font-weight: 800;
-    letter-spacing: .21em;
-    color: #85516f !important;
-    text-transform: uppercase;
-    margin: 0 0 1.5rem;
-}
-/* Las dos tarjetas forman una sola experiencia en cada etapa. */
-[data-testid="stVerticalBlockBorderWrapper"]:has(.auth-visual-anchor),
-[data-testid="stVerticalBlockBorderWrapper"]:has(.auth-form-anchor),
-[data-testid="stVerticalBlockBorderWrapper"]:has(.auth-welcome-anchor) {
-    border: 1px solid #f1dbe8 !important;
-    border-radius: 28px !important;
-    background: #fff !important;
-    box-shadow: 0 15px 46px rgba(96, 43, 86, .08), 0 2px 9px rgba(96, 43, 86, .04);
-    overflow: hidden;
-    min-height: 575px;
-}
-[data-testid="stVerticalBlockBorderWrapper"]:has(.auth-visual-anchor) > div,
-[data-testid="stVerticalBlockBorderWrapper"]:has(.auth-form-anchor) > div,
-[data-testid="stVerticalBlockBorderWrapper"]:has(.auth-welcome-anchor) > div {
-    padding: .85rem 1.15rem 1.35rem;
-}
-.auth-visual-anchor, .auth-form-anchor, .auth-welcome-anchor { height: 0; font-size: 0; }
-[data-testid="stVerticalBlockBorderWrapper"]:has(.auth-visual-anchor) [data-testid="stImage"] img {
-    width: 100%;
-    height: clamp(255px, 37vh, 340px);
-    object-fit: cover;
-    object-position: center;
-    border-radius: 18px;
-}
-.auth-visual-fallback {
-    height: clamp(255px, 37vh, 340px);
-    border-radius: 18px;
-    background: linear-gradient(160deg, #ffe3ee 0%, #f6c2db 55%, #fbe6f1 100%);
-    overflow: hidden;
-}
-.auth-visual-fallback svg { display: block; width: 100%; height: 100%; }
-.auth-welcome {
-    color: #b83272 !important;
-    text-align: center;
-    font-weight: 850;
-    font-size: clamp(1.85rem, 3.3vw, 2.5rem);
-    letter-spacing: -.04em;
-    margin: .55rem 0 .2rem;
-}
-.auth-welcome-text {
-    color: #665263 !important;
-    font-size: .95rem;
-    text-align: center;
-    line-height: 1.6;
-    max-width: 350px;
-    margin: .2rem auto 1.2rem;
-}
-.auth-mini-divider {
-    height: 3px;
-    width: 52px;
-    background: #edc0d7;
-    border-radius: 999px;
-    margin: 0 auto;
-}
-/* Bienvenida: no se muestran campos de acceso. */
-.auth-welcome-kicker {
-    color: #9c2d6a !important;
-    font-size: .75rem;
-    letter-spacing: .13em;
-    font-weight: 850;
-    margin: 2.45rem 0 1.2rem;
-    text-transform: uppercase;
-}
-.auth-welcome-headline {
-    font-size: clamp(2rem, 3.4vw, 3rem);
-    font-weight: 850;
-    line-height: 1.15;
-    letter-spacing: -.045em;
-    color: #482b44 !important;
-    margin: 0 0 1.15rem;
-}
-.auth-welcome-description {
-    font-size: 1.02rem;
-    line-height: 1.7;
-    color: #624e60 !important;
-    margin: 0 0 1.55rem;
-}
-.auth-welcome-features {
-    color: #624e60 !important;
-    font-size: .94rem;
-    line-height: 1.8;
-    background: #fff7fb;
-    border: 1px solid #f7dce9;
-    border-radius: 16px;
-    padding: 15px 18px;
-    margin: 0 0 1.45rem;
-}
-.auth-welcome-features strong { color: #5a3551 !important; }
-.auth-access-note {
-    text-align: center;
-    color: #715b6d !important;
-    font-size: .82rem;
-    margin-top: .85rem;
-}
-/* Encabezado con globos, solo en el formulario. */
-.auth-header-art {
-    height: 155px;
-    margin: -.85rem -1.15rem .9rem;
-    overflow: hidden;
-    border-radius: 18px 18px 26% 26% / 18px 18px 11% 11%;
-    background: #f8dce9;
-}
-.auth-header-art svg { width: 100%; height: 100%; display: block; }
-.auth-form-kicker {
-    font-size: .74rem;
-    font-weight: 850;
-    letter-spacing: .15em;
-    color: #984067 !important;
-    text-align: center;
-    margin-top: .15rem;
-}
-.auth-form-heading {
-    font-size: clamp(1.8rem, 3vw, 2.3rem);
-    font-weight: 850;
-    letter-spacing: -.04em;
-    line-height: 1.2;
-    color: #482b44 !important;
-    text-align: center;
-    margin: .35rem 0 .4rem;
-}
-.auth-form-subtitle {
-    color: #665263 !important;
-    font-size: .92rem;
-    line-height: 1.5;
-    text-align: center;
-    margin-bottom: .85rem;
-}
-/* Inputs y etiquetas: forzamos contraste independientemente del tema de Streamlit. */
-[data-testid="stVerticalBlockBorderWrapper"]:has(.auth-form-anchor) [data-testid="stForm"] {
-    border: 0 !important;
-    padding: 0 !important;
-    margin: 0 !important;
-}
-[data-testid="stVerticalBlockBorderWrapper"]:has(.auth-form-anchor) [data-testid="stWidgetLabel"] *,
-[data-testid="stVerticalBlockBorderWrapper"]:has(.auth-form-anchor) label,
-[data-testid="stVerticalBlockBorderWrapper"]:has(.auth-form-anchor) [data-testid="stExpander"] summary {
-    color: #482b44 !important;
-    opacity: 1 !important;
-    font-weight: 700;
-}
-[data-testid="stVerticalBlockBorderWrapper"]:has(.auth-form-anchor) [data-testid="stTextInput"] input {
-    background: #fffafe !important;
-    color: #36283a !important;
-    -webkit-text-fill-color: #36283a !important;
-    border: 1px solid #e9bfd5 !important;
-    border-radius: 12px !important;
-    min-height: 44px;
-    padding-left: .85rem !important;
-    color-scheme: light !important;
-}
-[data-testid="stVerticalBlockBorderWrapper"]:has(.auth-form-anchor) [data-testid="stTextInput"] input::placeholder {
-    color: #786574 !important;
-    -webkit-text-fill-color: #786574 !important;
-    opacity: 1 !important;
-}
-[data-testid="stVerticalBlockBorderWrapper"]:has(.auth-form-anchor) [data-testid="stTextInput"] input:focus {
-    border-color: #b83272 !important;
-    box-shadow: 0 0 0 3px rgba(184,50,114,.13) !important;
-}
-/* Empezar, iniciar sesión, recuperar contraseña: todos rosados, nunca naranja. */
-[data-testid="stVerticalBlockBorderWrapper"]:has(.auth-welcome-anchor) [data-testid="stButton"] button[kind="primary"],
-[data-testid="stVerticalBlockBorderWrapper"]:has(.auth-form-anchor) [data-testid="stFormSubmitButton"] button,
-[data-testid="stVerticalBlockBorderWrapper"]:has(.auth-form-anchor) button[kind="primaryFormSubmit"] {
-    background: #b83272 !important;
-    border: 1px solid #b83272 !important;
-    border-radius: 999px !important;
-    min-height: 3rem !important;
-    box-shadow: 0 7px 18px rgba(184,50,114,.12);
-}
-[data-testid="stVerticalBlockBorderWrapper"]:has(.auth-welcome-anchor) [data-testid="stButton"] button[kind="primary"]:hover,
-[data-testid="stVerticalBlockBorderWrapper"]:has(.auth-form-anchor) [data-testid="stFormSubmitButton"] button:hover,
-[data-testid="stVerticalBlockBorderWrapper"]:has(.auth-form-anchor) button[kind="primaryFormSubmit"]:hover {
-    background: #99275c !important;
-    border-color: #99275c !important;
-}
-[data-testid="stVerticalBlockBorderWrapper"]:has(.auth-welcome-anchor) [data-testid="stButton"] button[kind="primary"] *,
-[data-testid="stVerticalBlockBorderWrapper"]:has(.auth-form-anchor) [data-testid="stFormSubmitButton"] button *,
-[data-testid="stVerticalBlockBorderWrapper"]:has(.auth-form-anchor) button[kind="primaryFormSubmit"] * {
-    color: #fff !important;
-    -webkit-text-fill-color: #fff !important;
-    font-weight: 800 !important;
-}
-[data-testid="stVerticalBlockBorderWrapper"]:has(.auth-form-anchor) [data-testid="stButton"] button[kind="secondary"] {
-    background: #fff3fa !important;
-    border-color: #f0d4e1 !important;
-    color: #8b2456 !important;
-    border-radius: 999px !important;
-}
-[data-testid="stVerticalBlockBorderWrapper"]:has(.auth-form-anchor) [data-testid="stButton"] button[kind="secondary"] * {
-    color: #8b2456 !important;
-    -webkit-text-fill-color: #8b2456 !important;
-}
-[data-testid="stVerticalBlockBorderWrapper"]:has(.auth-form-anchor) [data-testid="stExpander"] {
-    background: #fffafd;
-    border: 1px solid #f0d4e1;
-    border-radius: 13px;
-}
-.auth-authorized {
-    text-align: center;
-    color: #715b6d !important;
-    font-size: .8rem;
-    margin-top: .65rem;
-}
-@media (max-width: 780px) {
-    [data-testid="stMainBlockContainer"] {
-        padding-top: 1.15rem !important;
-        padding-left: 1rem !important;
-        padding-right: 1rem !important;
-    }
-    [data-testid="stVerticalBlockBorderWrapper"]:has(.auth-visual-anchor),
-    [data-testid="stVerticalBlockBorderWrapper"]:has(.auth-form-anchor),
-    [data-testid="stVerticalBlockBorderWrapper"]:has(.auth-welcome-anchor) {
-        min-height: auto;
-        border-radius: 22px !important;
-    }
-    .auth-header-art { height: 115px; }
-    [data-testid="stVerticalBlockBorderWrapper"]:has(.auth-visual-anchor) [data-testid="stImage"] img,
-    .auth-visual-fallback { height: 205px; }
-    .auth-welcome-headline { font-size: 2.05rem; }
-    .auth-welcome-kicker { margin-top: .25rem; }
-    .auth-welcome { font-size: 1.85rem; }
-}
-</style>
-"""
 
 # =========================================================
 # BASE DE DATOS · SUPABASE / POSTGRESQL
@@ -1176,15 +1107,19 @@ def _connection_pool():
     """Reutiliza conexiones a Supabase para evitar reconectar en cada rerun."""
     return ThreadedConnectionPool(
         minconn=1,
-        maxconn=5,
+        maxconn=10,
         dsn=_database_url(),
         sslmode="require",
         connect_timeout=10,
+        application_name="arriendos-app",
+        # El pooler puede heredar una sesión de solo lectura si otra herramienta
+        # hizo SET default_transaction_read_only. La app necesita escritura.
+        options="-c default_transaction_read_only=off -c statement_timeout=30000",
     )
 
 
 class PgConnection:
-    def __init__(self, admin=False):
+    def __init__(self):
         self._pool = _connection_pool()
         self._conn = self._pool.getconn()
         self._released = False
@@ -1197,29 +1132,6 @@ class PgConnection:
                 pass
             self._conn = self._pool.getconn()
 
-        # TODAS las consultas de pantallas usan el rol PostgreSQL authenticated.
-        # El rol postgres de DATABASE_URL se reserva para esquema/gestión Auth.
-        # SET LOCAL se revierte con commit/rollback: seguro con Transaction pooler.
-        if not admin:
-            profile = st.session_state.get("auth_profile")
-            uid = st.session_state.get("auth_uid")
-            if not profile or not uid or str(profile["user_id"]) != str(uid):
-                self._pool.putconn(self._conn)
-                self._released = True
-                raise PermissionError("Inicia sesión para consultar la base de datos.")
-            try:
-                with self._conn.cursor() as cur:
-                    cur.execute("SELECT set_config('request.jwt.claim.sub', %s, true)", (str(uid),))
-                    cur.execute("SELECT set_config('request.jwt.claims', %s, true)",
-                                (json.dumps({"sub": str(uid), "role": "authenticated"}),))
-                    cur.execute("SELECT set_config('request.jwt.claim.role', 'authenticated', true)")
-                    cur.execute("SET LOCAL ROLE authenticated")
-            except Exception:
-                self._conn.rollback()
-                self._pool.putconn(self._conn)
-                self._released = True
-                raise
-
     def cursor(self):
         return PgCursor(self._conn.cursor(cursor_factory=DictCursor))
 
@@ -1230,12 +1142,6 @@ class PgConnection:
 
     def commit(self):
         self._conn.commit()
-        # Evita pantallas desactualizadas después de guardar una reserva,
-        # departamento, pago o una asignación de propietario.
-        for name in ("_departments_for_user", "_reservations_for_user"):
-            cached_fn = globals().get(name)
-            if cached_fn is not None:
-                cached_fn.clear()
 
     def rollback(self):
         self._conn.rollback()
@@ -1254,21 +1160,52 @@ class PgConnection:
         finally:
             self._released = True
 
+    def __enter__(self):
+        return self
 
-def db(admin=False):
-    # admin=True solo está permitido para creación de esquema, alta de cuentas
-    # y lectura del índice RUT -> Auth, nunca para consultas de páginas.
+    def __exit__(self, exc_type, exc, tb):
+        if exc_type is not None:
+            try:
+                self.rollback()
+            except Exception:
+                pass
+        self.close()
+        return False
+
+    def __del__(self):
+        # Red de seguridad para no agotar el pool si una función falla antes
+        # de llamar a close().
+        try:
+            self.close()
+        except Exception:
+            pass
+
+
+def db():
     try:
-        return PgConnection(admin=admin)
-    except PermissionError:
-        st.error("No tienes una sesión autorizada.")
-        st.stop()
+        return PgConnection()
     except Exception:
         st.error(
-            "No fue posible conectar con Supabase. Revisa DATABASE_URL y "
-            "que el SQL de migración se haya aplicado correctamente."
+            "No fue posible conectar con Supabase. Revisa DATABASE_URL en "
+            "Streamlit Secrets y confirma que estás usando la URI del Transaction pooler."
         )
         st.stop()
+
+
+@contextmanager
+def db_connection():
+    """Conexión con cierre garantizado incluso si hay una excepción."""
+    conn = db()
+    try:
+        yield conn
+    except Exception:
+        try:
+            conn.rollback()
+        except Exception:
+            pass
+        raise
+    finally:
+        conn.close()
 
 
 def _existing_columns(cur, table):
@@ -1286,489 +1223,98 @@ def table_columns(table):
         raise ValueError("Tabla no permitida")
 
     conn = db()
-    cur = conn.cursor()
-    columns = _existing_columns(cur, table)
-    conn.close()
-    return columns
+    try:
+        cur = conn.cursor()
+        return _existing_columns(cur, table)
+    finally:
+        conn.close()
 
 
 @st.cache_resource
 def init_db():
-    """Compatibilidad con tablas existentes; operaciones DDL exclusivamente backend."""
-    conn = db(admin=True)
-    cur = conn.cursor()
+    """Verifica que la base tenga la migración aplicada.
 
-    cur.execute("""
-        CREATE TABLE IF NOT EXISTS departments (
-            id BIGSERIAL PRIMARY KEY,
-            condo TEXT NOT NULL DEFAULT '',
-            name TEXT NOT NULL DEFAULT '',
-            capacity INTEGER NOT NULL DEFAULT 2,
-            winter_price BIGINT NOT NULL DEFAULT 0,
-            summer_price BIGINT NOT NULL DEFAULT 0,
-            active INTEGER NOT NULL DEFAULT 1
-        )
-    """)
-
-    cur.execute("""
-        CREATE TABLE IF NOT EXISTS reservations (
-            id BIGSERIAL PRIMARY KEY,
-            department_id BIGINT NOT NULL REFERENCES departments(id),
-            guest TEXT NOT NULL DEFAULT '',
-            guest_name TEXT NOT NULL DEFAULT '',
-            phone TEXT DEFAULT '',
-            check_in TEXT NOT NULL,
-            check_in_time TEXT DEFAULT '15:00',
-            check_out TEXT NOT NULL,
-            check_out_time TEXT DEFAULT '11:00',
-            guests INTEGER NOT NULL DEFAULT 1,
-            price_night BIGINT NOT NULL DEFAULT 0,
-            nights INTEGER NOT NULL DEFAULT 1,
-            total BIGINT NOT NULL DEFAULT 0,
-            deposit_percent DOUBLE PRECISION NOT NULL DEFAULT 0,
-            deposited BIGINT NOT NULL DEFAULT 0,
-            status TEXT NOT NULL DEFAULT 'Sin abono'
-        )
-    """)
-
-    cur.execute("""
-        CREATE TABLE IF NOT EXISTS payments (
-            id BIGSERIAL PRIMARY KEY,
-            reservation_id BIGINT NOT NULL REFERENCES reservations(id) ON DELETE CASCADE,
-            amount BIGINT NOT NULL DEFAULT 0,
-            payment_date TEXT NOT NULL DEFAULT '',
-            note TEXT DEFAULT ''
-        )
-    """)
-
-    cur.execute("""
-        CREATE TABLE IF NOT EXISTS checklist (
-            id BIGSERIAL PRIMARY KEY,
-            reservation_id BIGINT NOT NULL UNIQUE REFERENCES reservations(id) ON DELETE CASCADE,
-            cleaning INTEGER NOT NULL DEFAULT 0,
-            internet INTEGER NOT NULL DEFAULT 0,
-            inspected INTEGER NOT NULL DEFAULT 0,
-            keys INTEGER NOT NULL DEFAULT 0
-        )
-    """)
-
-    # Una sola fotografía por edificio/condominio. Se guarda en Supabase
-    # para que no se pierda cuando Streamlit se reinicie.
-    cur.execute("""
-        CREATE TABLE IF NOT EXISTS condo_images (
-            condo_key TEXT PRIMARY KEY,
-            condo_name TEXT NOT NULL DEFAULT '',
-            image_data BYTEA NOT NULL,
-            image_mime TEXT NOT NULL DEFAULT 'image/jpeg',
-            updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
-        )
-    """)
-    # Supabase puede exponer las tablas nuevas mediante Data API.
-    # Activamos RLS para que la foto no quede accesible públicamente por la API.
-    cur.execute("ALTER TABLE condo_images ENABLE ROW LEVEL SECURITY")
-
-    def add_column_if_missing(table, column, definition):
-        columns = _existing_columns(cur, table)
-        if column not in columns:
-            cur.execute(f'ALTER TABLE {table} ADD COLUMN {column} {definition}')
-
-    add_column_if_missing("departments", "condo", "TEXT NOT NULL DEFAULT ''")
-    add_column_if_missing("departments", "name", "TEXT NOT NULL DEFAULT ''")
-    add_column_if_missing("departments", "capacity", "INTEGER NOT NULL DEFAULT 2")
-    add_column_if_missing("departments", "winter_price", "BIGINT NOT NULL DEFAULT 0")
-    add_column_if_missing("departments", "summer_price", "BIGINT NOT NULL DEFAULT 0")
-    add_column_if_missing("departments", "active", "INTEGER NOT NULL DEFAULT 1")
-
-    dept_cols = _existing_columns(cur, "departments")
-    if "condominium" in dept_cols:
+    La app ya no crea tablas ni siembra datos al arrancar: el esquema se
+    administra con los archivos de migrations/.
+    """
+    conn = db()
+    try:
+        cur = conn.cursor()
         cur.execute("""
-            UPDATE departments
-            SET condo = condominium
-            WHERE (condo IS NULL OR TRIM(condo) = '')
-              AND condominium IS NOT NULL
+            SELECT
+                to_regclass('public.departments') IS NOT NULL AS departments,
+                to_regclass('public.reservations') IS NOT NULL AS reservations,
+                to_regclass('public.payments') IS NOT NULL AS payments,
+                to_regclass('public.owner_liquidations') IS NOT NULL AS liquidations,
+                to_regclass('public.seasons') IS NOT NULL AS seasons,
+                to_regclass('public.department_blocks') IS NOT NULL AS blocks,
+                EXISTS (
+                    SELECT 1 FROM information_schema.columns
+                    WHERE table_schema='public' AND table_name='payments'
+                      AND column_name='voided_at'
+                ) AS payments_migrated,
+                EXISTS (
+                    SELECT 1 FROM information_schema.columns
+                    WHERE table_schema='public' AND table_name='reservations'
+                      AND column_name='deposit_due'
+                ) AS reservations_migrated
         """)
-
-    add_column_if_missing("reservations", "department_id", "BIGINT")
-    add_column_if_missing("reservations", "guest", "TEXT NOT NULL DEFAULT ''")
-    add_column_if_missing("reservations", "guest_name", "TEXT NOT NULL DEFAULT ''")
-    add_column_if_missing("reservations", "phone", "TEXT DEFAULT ''")
-    add_column_if_missing("reservations", "check_in", "TEXT NOT NULL DEFAULT '2000-01-01'")
-    add_column_if_missing("reservations", "check_in_time", "TEXT DEFAULT '15:00'")
-    add_column_if_missing("reservations", "check_out", "TEXT NOT NULL DEFAULT '2000-01-02'")
-    add_column_if_missing("reservations", "check_out_time", "TEXT DEFAULT '11:00'")
-    add_column_if_missing("reservations", "guests", "INTEGER NOT NULL DEFAULT 1")
-    add_column_if_missing("reservations", "price_night", "BIGINT NOT NULL DEFAULT 0")
-    add_column_if_missing("reservations", "nights", "INTEGER NOT NULL DEFAULT 1")
-    add_column_if_missing("reservations", "total", "BIGINT NOT NULL DEFAULT 0")
-    add_column_if_missing("reservations", "deposit_percent", "DOUBLE PRECISION NOT NULL DEFAULT 0")
-    add_column_if_missing("reservations", "deposited", "BIGINT NOT NULL DEFAULT 0")
-    add_column_if_missing("reservations", "status", "TEXT NOT NULL DEFAULT 'Sin abono'")
-
-    res_cols = _existing_columns(cur, "reservations")
-    if "nightly_price" in res_cols:
-        cur.execute("""
-            UPDATE reservations
-            SET price_night = nightly_price
-            WHERE COALESCE(price_night, 0) = 0
-              AND nightly_price IS NOT NULL
-        """)
-
-    cur.execute("""
-        UPDATE reservations
-        SET guest_name = guest
-        WHERE (guest_name IS NULL OR TRIM(guest_name) = '')
-          AND guest IS NOT NULL
-    """)
-
-    add_column_if_missing("payments", "payment_date", "TEXT NOT NULL DEFAULT ''")
-    payment_cols = _existing_columns(cur, "payments")
-    if "date" in payment_cols:
-        cur.execute("""
-            UPDATE payments
-            SET payment_date = "date"
-            WHERE (payment_date IS NULL OR TRIM(payment_date) = '')
-              AND "date" IS NOT NULL
-        """)
-
-    add_column_if_missing("checklist", "cleaning", "INTEGER NOT NULL DEFAULT 0")
-    add_column_if_missing("checklist", "internet", "INTEGER NOT NULL DEFAULT 0")
-    add_column_if_missing("checklist", "inspected", "INTEGER NOT NULL DEFAULT 0")
-    add_column_if_missing("checklist", "keys", "INTEGER NOT NULL DEFAULT 0")
-
-
-    # Liquidaciones para propietarios: una por reserva y preferencias por departamento.
-    # Los importes de cada liquidación se guardan como fotografía histórica.
-    cur.execute("""
-        CREATE TABLE IF NOT EXISTS owner_liquidation_settings (
-            department_id BIGINT PRIMARY KEY REFERENCES departments(id) ON DELETE CASCADE,
-            owner_name TEXT NOT NULL DEFAULT '',
-            commission_percent SMALLINT NOT NULL DEFAULT 10
-                CHECK (commission_percent IN (10, 12)),
-            usual_costs JSONB NOT NULL DEFAULT '{}'::jsonb,
-            updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
-        )
-    """)
-    cur.execute("""
-        CREATE TABLE IF NOT EXISTS owner_liquidations (
-            id BIGSERIAL PRIMARY KEY,
-            reservation_id BIGINT NOT NULL UNIQUE
-                REFERENCES reservations(id) ON DELETE CASCADE,
-            owner_name TEXT NOT NULL DEFAULT '',
-            condo_name TEXT NOT NULL DEFAULT '',
-            department_name TEXT NOT NULL DEFAULT '',
-            guest_name TEXT NOT NULL DEFAULT '',
-            check_in TEXT NOT NULL,
-            check_out TEXT NOT NULL,
-            nights INTEGER NOT NULL DEFAULT 0,
-            price_night BIGINT NOT NULL DEFAULT 0,
-            gross_total BIGINT NOT NULL DEFAULT 0,
-            commission_percent SMALLINT NOT NULL CHECK (commission_percent IN (10, 12)),
-            commission_amount BIGINT NOT NULL DEFAULT 0,
-            expenses JSONB NOT NULL DEFAULT '[]'::jsonb,
-            expenses_total BIGINT NOT NULL DEFAULT 0,
-            owner_net BIGINT NOT NULL DEFAULT 0,
-            notes TEXT NOT NULL DEFAULT '',
-            issued_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-            updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
-        )
-    """)
-    # El acceso desde la aplicación es mediante la conexión privada a PostgreSQL;
-    # se impide que la Data API pública exponga estas tablas sin políticas.
-    cur.execute("ALTER TABLE owner_liquidation_settings ENABLE ROW LEVEL SECURITY")
-    cur.execute("ALTER TABLE owner_liquidations ENABLE ROW LEVEL SECURITY")
-
-    count = cur.execute("SELECT COUNT(*) AS total FROM departments").fetchone()["total"]
-    if count == 0:
-        departments = [
-            ("Serena Pacífico", "Depto 101", 4, 60000, 90000),
-            ("Serena Pacífico", "Depto 202", 5, 65000, 95000),
-            ("Serena Pacífico", "Depto 305", 4, 70000, 100000),
-            ("Serena Pacífico", "Depto 406", 6, 75000, 110000),
-            ("Las Gredas", "Depto 1", 4, 60000, 90000),
-            ("Las Gredas", "Depto 2", 5, 65000, 95000),
-            ("Las Gredas", "Depto 3", 6, 70000, 105000),
-            ("Oceanic", "Depto 101", 4, 65000, 95000),
-            ("Oceanic", "Depto 202", 5, 70000, 105000),
+        row = cur.fetchone()
+        missing = [
+            name for name in
+            ("departments", "reservations", "payments", "liquidations", "seasons", "blocks")
+            if not row[name]
         ]
-        cur.executemany("""
-            INSERT INTO departments
-            (condo, name, capacity, winter_price, summer_price)
-            VALUES (?, ?, ?, ?, ?)
-        """, departments)
-
-    conn.commit()
-    conn.close()
+        if missing:
+            st.error(
+                "Falta aplicar la migración de la base. Tablas ausentes: "
+                + ", ".join(missing)
+                + ". Ejecuta migrations/001_improvements.sql."
+            )
+            st.stop()
+        if not row["payments_migrated"] or not row["reservations_migrated"]:
+            st.error(
+                "La base no tiene la migración 001 aplicada. "
+                "Ejecuta migrations/001_improvements.sql antes de usar la app."
+            )
+            st.stop()
+    finally:
+        conn.close()
 
 
 init_db()
 
 # =========================================================
-# MODO SIN LOGIN — USO PRIVADO EXCLUSIVAMENTE
-# =========================================================
-# ADVERTENCIA: toda persona con acceso a esta aplicación podrá actuar como
-# administrador. Antes de publicarla, restringir su acceso en Streamlit Cloud:
-# Settings -> Sharing -> Only specific people can view this app.
-# No se realizan llamadas a Supabase Auth.
-
-
-def current_role():
-    return "admin"
-
-
-def is_admin():
-    return True
-
-
-def normalizar_rut(valor):
-    """Valida el RUT al registrar un propietario; no autentica usuarios."""
-    limpio = re.sub(r"[^0-9kK]", "", str(valor)).upper()
-    if not re.fullmatch(r"[0-9]{1,8}[0-9K]", limpio):
-        raise ValueError("Ingresa un RUT válido.")
-    numero, dv = str(int(limpio[:-1])), limpio[-1]
-    factores = (2, 3, 4, 5, 6, 7)
-    total = sum(int(digito) * factores[i % 6]
-                for i, digito in enumerate(reversed(numero)))
-    resto = 11 - (total % 11)
-    correcto = "0" if resto == 11 else "K" if resto == 10 else str(resto)
-    if dv != correcto:
-        raise ValueError("El dígito verificador del RUT es incorrecto.")
-    return f"{numero}-{dv}"
-
-
-def _iniciar_modo_privado_sin_login():
-    """Identidad de administrador para compatibilidad con las políticas RLS existentes.
-
-    No valida identidad de visitantes. Solo es apropiado para un despliegue
-    privado con acceso restringido en Streamlit Cloud.
-    """
-    conn = db(admin=True)
-    try:
-        fila = conn.execute("""
-            SELECT user_id, rut, full_name, login_email, role,
-                   owner_id, is_active, must_change_password
-            FROM public.user_profiles
-            WHERE role = 'admin' AND is_active = TRUE
-            ORDER BY user_id LIMIT 1
-        """).fetchone()
-    finally:
-        conn.close()
-    if not fila:
-        st.error("No se encontró un perfil administrador activo en la base de datos.")
-        st.stop()
-    perfil = dict(fila)
-    # RLS y created_by siguen usando el UUID real del administrador existente.
-    st.session_state["auth_profile"] = perfil
-    st.session_state["auth_uid"] = str(perfil["user_id"])
-
-
-_iniciar_modo_privado_sin_login()
-
-# =========================================================
 # FUNCIONES
 # =========================================================
-
-def money(value):
-    return f"${int(value):,}".replace(",", ".")
-
 
 def department_columns():
     return table_columns("departments")
 
 
-def insert_department(condo, name, capacity, winter, summer, owner_id):
-    """Inserta un departamento y mantiene compatibilidad con esquemas antiguos."""
-    conn = db()
-    cols = department_columns()
-
-    if "condominium" in cols:
-        conn.execute("""
-            INSERT INTO departments
-            (condo, condominium, name, capacity, winter_price, summer_price, owner_id)
-            VALUES (?, ?, ?, ?, ?, ?, ?)
-        """, (condo, condo, name, capacity, winter, summer, owner_id))
-    else:
-        conn.execute("""
-            INSERT INTO departments
-            (condo, name, capacity, winter_price, summer_price, owner_id)
-            VALUES (?, ?, ?, ?, ?, ?)
-        """, (condo, name, capacity, winter, summer, owner_id))
-
-    conn.commit()
-    conn.close()
-
-
-def delete_reservation(reservation_id):
-    """Elimina la reserva y sus datos asociados."""
-    conn = db()
-    conn.execute("DELETE FROM payments WHERE reservation_id=?", (reservation_id,))
-    conn.execute("DELETE FROM checklist WHERE reservation_id=?", (reservation_id,))
-    conn.execute("DELETE FROM reservations WHERE id=?", (reservation_id,))
-    conn.commit()
-    conn.close()
-
-
-@st.cache_data(ttl=15, max_entries=128, show_spinner=False)
-def _departments_for_user(user_id, owner_id):
-    """Caché por usuario. Nunca compartir resultados entre propietarios."""
-    conn = db()
-    try:
-        rows = conn.execute("""
-            SELECT d.*, o.rut AS owner_rut, o.full_name AS owner_name
-            FROM departments d LEFT JOIN owners o ON o.id=d.owner_id
-            WHERE d.active=1
-            ORDER BY d.condo, d.name
-        """).fetchall()
-        return [dict(row) for row in rows]
-    finally:
-        conn.close()
-
-
-def get_departments():
-    profile = st.session_state["auth_profile"]
-    return _departments_for_user(str(st.session_state["auth_uid"]),
-                                 str(profile.get("owner_id") or "admin"))
-
-
-@st.cache_data(ttl=15, max_entries=128, show_spinner=False)
-def _reservations_for_user(user_id, owner_id):
-    """RLS sigue aplicado al consultar y la caché está aislada por identidad."""
-    conn = db()
-    try:
-        rows = conn.execute("""
-            SELECT r.*, d.name AS dept_name, d.condo, d.capacity
-            FROM reservations r
-            JOIN departments d ON d.id=r.department_id
-            ORDER BY r.check_in
-        """).fetchall()
-        return [dict(row) for row in rows]
-    finally:
-        conn.close()
-
-
-def get_reservations():
-    profile = st.session_state["auth_profile"]
-    return _reservations_for_user(str(st.session_state["auth_uid"]),
-                                  str(profile.get("owner_id") or "admin"))
-
-
-def get_reservation(reservation_id):
-    conn = db()
-    row = conn.execute("""
-        SELECT r.*, d.name AS dept_name, d.condo, d.capacity
-        FROM reservations r
-        JOIN departments d ON d.id=r.department_id
-        WHERE r.id=?
-    """, (reservation_id,)).fetchone()
-    conn.close()
-    return row
-
-
-def conflict_exists(department_id, check_in, check_out, ignore_id=None):
-    conn = db()
-
-    query = """
-        SELECT id, guest, check_in, check_out
-        FROM reservations
-        WHERE department_id=?
-          AND check_in < ?
-          AND check_out > ?
-    """
-    params = [department_id, check_out.isoformat(), check_in.isoformat()]
-
-    if ignore_id is not None:
-        query += " AND id != ?"
-        params.append(ignore_id)
-
-    row = conn.execute(query, params).fetchone()
-    conn.close()
-    return row
-
-
-def save_reservation(
-    department_id, guest, phone, check_in, check_in_time,
-    check_out, check_out_time, guests, price_night,
-    deposit_percent, status, reservation_id=None
+def insert_department(
+    condo, name, capacity, winter, summer,
+    owner_id=None, address="", access_instructions="",
+    wifi_name="", wifi_password="", notes="",
+    default_check_in_time="15:00", default_check_out_time="11:00",
 ):
-    nights = (check_out - check_in).days
-    total = nights * price_night
-    deposited = round(total * (deposit_percent / 100))
-
+    """Inserta un departamento con los datos operativos opcionales."""
     conn = db()
     try:
         cur = conn.cursor()
-        reservation_columns = table_columns("reservations")
-
-        if reservation_id:
-            if not is_admin():
-                raise PermissionError("Solo la administradora puede editar una reserva.")
-            if "guest_name" in reservation_columns:
-                cur.execute("""
-                    UPDATE reservations
-                    SET department_id=?, guest=?, guest_name=?, phone=?, check_in=?,
-                        check_in_time=?, check_out=?, check_out_time=?,
-                        guests=?, price_night=?, nights=?, total=?,
-                        deposit_percent=?, deposited=?, status=?
-                    WHERE id=?
-                """, (
-                    department_id, guest, guest, phone, check_in.isoformat(),
-                    check_in_time, check_out.isoformat(), check_out_time,
-                    guests, price_night, nights, total,
-                    deposit_percent, deposited, status, reservation_id
-                ))
-            else:
-                cur.execute("""
-                    UPDATE reservations
-                    SET department_id=?, guest=?, phone=?, check_in=?,
-                        check_in_time=?, check_out=?, check_out_time=?,
-                        guests=?, price_night=?, nights=?, total=?,
-                        deposit_percent=?, deposited=?, status=?
-                    WHERE id=?
-                """, (
-                    department_id, guest, phone, check_in.isoformat(),
-                    check_in_time, check_out.isoformat(), check_out_time,
-                    guests, price_night, nights, total,
-                    deposit_percent, deposited, status, reservation_id
-                ))
-            rid = reservation_id
-        else:
-            if "guest_name" in reservation_columns:
-                cur.execute("""
-                    INSERT INTO reservations
-                    (department_id, guest, guest_name, phone, check_in, check_in_time,
-                     check_out, check_out_time, guests, price_night, nights,
-                     total, deposit_percent, deposited, status, created_by)
-                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                    RETURNING id
-                """, (
-                    department_id, guest, guest, phone, check_in.isoformat(),
-                    check_in_time, check_out.isoformat(), check_out_time,
-                    guests, price_night, nights, total,
-                    deposit_percent, deposited, status, st.session_state["auth_uid"]
-                ))
-            else:
-                cur.execute("""
-                    INSERT INTO reservations
-                    (department_id, guest, phone, check_in, check_in_time,
-                     check_out, check_out_time, guests, price_night, nights,
-                     total, deposit_percent, deposited, status, created_by)
-                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                    RETURNING id
-                """, (
-                    department_id, guest, phone, check_in.isoformat(),
-                    check_in_time, check_out.isoformat(), check_out_time,
-                    guests, price_night, nights, total,
-                    deposit_percent, deposited, status, st.session_state["auth_uid"]
-                ))
-
-            rid = cur.fetchone()["id"]
-
-            cur.execute("""
-                INSERT INTO checklist
-                (reservation_id, cleaning, internet, inspected, keys)
-                VALUES (?, 0, 0, 0, 0)
-                ON CONFLICT (reservation_id) DO NOTHING
-            """, (rid,))
-
+        rid = cur.execute("""
+            INSERT INTO departments
+                (condo, name, capacity, winter_price, summer_price, owner_id,
+                 address, access_instructions, wifi_name, wifi_password, notes,
+                 default_check_in_time, default_check_out_time)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            RETURNING id
+        """, (
+            condo.strip(), name.strip(), int(capacity), int(winter), int(summer),
+            owner_id, address.strip(), access_instructions.strip(),
+            wifi_name.strip(), wifi_password.strip(), notes.strip(),
+            default_check_in_time, default_check_out_time,
+        )).fetchone()["id"]
         conn.commit()
         return rid
     except Exception:
@@ -1778,41 +1324,556 @@ def save_reservation(
         conn.close()
 
 
-def update_checklist(reservation_id, cleaning, internet, inspected, keys):
+def update_department(department_id, **fields):
+    """Actualiza solo columnas permitidas de un departamento."""
+    allowed = {
+        "condo", "name", "capacity", "winter_price", "summer_price",
+        "owner_id", "address", "access_instructions", "wifi_name",
+        "wifi_password", "notes", "default_check_in_time",
+        "default_check_out_time", "active", "archived_at",
+    }
+    clean = {k: v for k, v in fields.items() if k in allowed}
+    if not clean:
+        return
+    assignments = ", ".join(f"{key}=?" for key in clean)
     conn = db()
-    conn.execute("""
-        INSERT INTO checklist
-        (reservation_id, cleaning, internet, inspected, keys)
-        VALUES (?, ?, ?, ?, ?)
-        ON CONFLICT(reservation_id)
-        DO UPDATE SET
-            cleaning=excluded.cleaning,
-            internet=excluded.internet,
-            inspected=excluded.inspected,
-            keys=excluded.keys
-    """, (
-        reservation_id,
-        int(cleaning),
-        int(internet),
-        int(inspected),
-        int(keys),
-    ))
-    conn.commit()
-    conn.close()
+    try:
+        conn.execute(
+            f"UPDATE departments SET {assignments} WHERE id=?",
+            (*clean.values(), int(department_id)),
+        )
+        conn.commit()
+    except Exception:
+        conn.rollback()
+        raise
+    finally:
+        conn.close()
+
+
+def archive_department(department_id):
+    """Oculta un departamento sin borrar su historial."""
+    conn = db()
+    try:
+        conn.execute(
+            "UPDATE departments SET active=0, archived_at=NOW() WHERE id=?",
+            (int(department_id),),
+        )
+        conn.commit()
+    except Exception:
+        conn.rollback()
+        raise
+    finally:
+        conn.close()
+
+
+def delete_department_safe(department_id):
+    """Elimina un departamento solo si no tiene reservas ni liquidaciones."""
+    conn = db()
+    try:
+        cur = conn.cursor()
+        row = cur.execute("""
+            SELECT
+                (SELECT COUNT(*) FROM reservations WHERE department_id=?) AS reservations,
+                (SELECT COUNT(*) FROM owner_liquidations ol
+                   JOIN reservations r ON r.id=ol.reservation_id
+                  WHERE r.department_id=?) AS liquidations,
+                condo
+            FROM departments WHERE id=?
+        """, (department_id, department_id, department_id)).fetchone()
+        if not row:
+            raise ValueError("El departamento ya no existe.")
+        if row["reservations"] or row["liquidations"]:
+            raise ValueError(
+                "El departamento tiene reservas o liquidaciones asociadas. "
+                "Archívalo en lugar de eliminarlo."
+            )
+        cur.execute("DELETE FROM departments WHERE id=?", (department_id,))
+        conn.commit()
+        return row["condo"]
+    except Exception:
+        conn.rollback()
+        raise
+    finally:
+        conn.close()
+
+
+def get_departments(include_inactive=False):
+    conn = db()
+    try:
+        where = (
+            "" if include_inactive
+            else "WHERE COALESCE(d.active, 1)=1 AND d.archived_at IS NULL"
+        )
+        return conn.execute(f"""
+            SELECT d.*, o.full_name AS owner_display_name
+            FROM departments d
+            LEFT JOIN owners o ON o.id=d.owner_id
+            {where}
+            ORDER BY d.condo, d.name
+        """).fetchall()
+    finally:
+        conn.close()
+
+
+def get_department(department_id):
+    conn = db()
+    try:
+        return conn.execute("""
+            SELECT d.*, o.full_name AS owner_display_name
+            FROM departments d
+            LEFT JOIN owners o ON o.id=d.owner_id
+            WHERE d.id=?
+        """, (department_id,)).fetchone()
+    finally:
+        conn.close()
+
+
+def get_owners(active_only=False):
+    conn = db()
+    try:
+        where = "WHERE active=TRUE" if active_only else ""
+        return conn.execute(f"""
+            SELECT * FROM owners {where} ORDER BY active DESC, full_name
+        """).fetchall()
+    finally:
+        conn.close()
+
+
+def save_owner(full_name, rut="", phone="", email="", bank_name="",
+               bank_account="", bank_holder="", commission_percent=10,
+               notes="", active=True, owner_id=None):
+    conn = db()
+    try:
+        cur = conn.cursor()
+        if owner_id:
+            cur.execute("""
+                UPDATE owners
+                SET full_name=?, rut=?, phone=?, email=?, bank_name=?,
+                    bank_account=?, bank_holder=?, commission_percent=?,
+                    notes=?, active=?
+                WHERE id=?
+            """, (
+                full_name.strip(), rut.strip(), phone.strip(), email.strip(),
+                bank_name.strip(), bank_account.strip(), bank_holder.strip(),
+                int(commission_percent), notes.strip(), bool(active), int(owner_id),
+            ))
+            new_id = int(owner_id)
+        else:
+            new_id = cur.execute("""
+                INSERT INTO owners
+                    (full_name, rut, phone, email, bank_name, bank_account,
+                     bank_holder, commission_percent, notes, active)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                RETURNING id
+            """, (
+                full_name.strip(), rut.strip(), phone.strip(), email.strip(),
+                bank_name.strip(), bank_account.strip(), bank_holder.strip(),
+                int(commission_percent), notes.strip(), bool(active),
+            )).fetchone()["id"]
+        conn.commit()
+        return new_id
+    except psycopg2.errors.UniqueViolation as exc:
+        conn.rollback()
+        raise ValueError(
+            "Ya existe un propietario con ese RUT. Revisa los datos."
+        ) from exc
+    except Exception:
+        conn.rollback()
+        raise
+    finally:
+        conn.close()
+
+
+def get_seasons(department_id=None, condo=None, active_only=True):
+    conn = db()
+    try:
+        filters = []
+        params = []
+        if active_only:
+            filters.append("active=TRUE")
+        if department_id is not None:
+            filters.append("(department_id=? OR department_id IS NULL)")
+            params.append(int(department_id))
+        if condo:
+            filters.append("(condo=? OR condo IS NULL OR condo='')")
+            params.append(condo)
+        where = ("WHERE " + " AND ".join(filters)) if filters else ""
+        return conn.execute(f"""
+            SELECT * FROM seasons {where}
+            ORDER BY start_date, priority DESC, id
+        """, params).fetchall()
+    finally:
+        conn.close()
+
+
+def add_season(name, start_date, end_date, price_per_night,
+               department_id=None, condo=None, min_nights=1, priority=0):
+    conn = db()
+    try:
+        rid = conn.execute("""
+            INSERT INTO seasons
+                (name, start_date, end_date, price_per_night, min_nights,
+                 department_id, condo, priority)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+            RETURNING id
+        """, (
+            name.strip(), start_date, end_date, int(price_per_night),
+            int(min_nights), department_id,
+            condo.strip() if condo else None, int(priority),
+        )).fetchone()["id"]
+        conn.commit()
+        return rid
+    except Exception:
+        conn.rollback()
+        raise
+    finally:
+        conn.close()
+
+
+def delete_season(season_id):
+    conn = db()
+    try:
+        conn.execute("DELETE FROM seasons WHERE id=?", (int(season_id),))
+        conn.commit()
+    except Exception:
+        conn.rollback()
+        raise
+    finally:
+        conn.close()
+
+
+def get_blocks(department_id=None):
+    conn = db()
+    try:
+        where = "WHERE b.department_id=?" if department_id is not None else ""
+        params = (int(department_id),) if department_id is not None else ()
+        return conn.execute(f"""
+            SELECT b.*, d.condo, d.name AS dept_name
+            FROM department_blocks b
+            JOIN departments d ON d.id=b.department_id
+            {where}
+            ORDER BY b.start_date
+        """, params).fetchall()
+    finally:
+        conn.close()
+
+
+def add_block(department_id, start_date, end_date, reason="Mantención"):
+    conn = db()
+    try:
+        rid = conn.execute("""
+            INSERT INTO department_blocks (department_id, start_date, end_date, reason)
+            VALUES (?, ?, ?, ?)
+            RETURNING id
+        """, (int(department_id), start_date, end_date, reason.strip())).fetchone()["id"]
+        conn.commit()
+        return rid
+    except Exception:
+        conn.rollback()
+        raise
+    finally:
+        conn.close()
+
+
+def delete_block(block_id):
+    conn = db()
+    try:
+        conn.execute("DELETE FROM department_blocks WHERE id=?", (int(block_id),))
+        conn.commit()
+    except Exception:
+        conn.rollback()
+        raise
+    finally:
+        conn.close()
+
+
+RESERVATION_SELECT = """
+    SELECT r.*, d.name AS dept_name, d.condo, d.capacity, d.owner_id,
+           o.full_name AS owner_display_name,
+           COALESCE(pay.paid, 0) AS paid
+    FROM reservations r
+    JOIN departments d ON d.id=r.department_id
+    LEFT JOIN owners o ON o.id=d.owner_id
+    LEFT JOIN (
+        SELECT reservation_id, SUM(amount) AS paid
+        FROM payments
+        WHERE voided_at IS NULL
+        GROUP BY reservation_id
+    ) pay ON pay.reservation_id=r.id
+"""
+
+
+def get_reservations(include_cancelled=False):
+    conn = db()
+    try:
+        where = "" if include_cancelled else "WHERE r.status <> 'Cancelada'"
+        return conn.execute(f"""
+            {RESERVATION_SELECT}
+            {where}
+            ORDER BY r.check_in
+        """).fetchall()
+    finally:
+        conn.close()
+
+
+def get_reservation(reservation_id):
+    conn = db()
+    try:
+        return conn.execute(
+            f"{RESERVATION_SELECT} WHERE r.id=?",
+            (int(reservation_id),),
+        ).fetchone()
+    finally:
+        conn.close()
+
+
+def conflict_exists(department_id, check_in, check_out, ignore_id=None):
+    """Choque con otra reserva vigente, usando las columnas DATE."""
+    conn = db()
+    try:
+        query = """
+            SELECT id, guest, check_in, check_out
+            FROM reservations
+            WHERE department_id=?
+              AND status <> 'Cancelada'
+              AND COALESCE(check_in_date, check_in::date) < ?::date
+              AND COALESCE(check_out_date, check_out::date) > ?::date
+        """
+        params = [int(department_id), check_out, check_in]
+        if ignore_id is not None:
+            query += " AND id <> ?"
+            params.append(int(ignore_id))
+        return conn.execute(query, params).fetchone()
+    finally:
+        conn.close()
+
+
+def block_conflict_exists(department_id, check_in, check_out):
+    conn = db()
+    try:
+        return conn.execute("""
+            SELECT id, start_date, end_date, reason
+            FROM department_blocks
+            WHERE department_id=?
+              AND daterange(start_date, end_date, '[)')
+                  && daterange(?::date, ?::date, '[)')
+        """, (int(department_id), check_in, check_out)).fetchone()
+    finally:
+        conn.close()
+
+
+def recompute_reservation(cur, reservation_id):
+    """Deja deposited y status en función de los pagos vigentes."""
+    row = cur.execute(
+        "SELECT id, total, status FROM reservations WHERE id=? FOR UPDATE",
+        (int(reservation_id),),
+    ).fetchone()
+    if not row:
+        return None
+    if row["status"] == STATUS_CANCELLED:
+        return row["status"]
+    paid = cur.execute("""
+        SELECT COALESCE(SUM(amount), 0) AS paid
+        FROM payments
+        WHERE reservation_id=? AND voided_at IS NULL
+    """, (int(reservation_id),)).fetchone()["paid"]
+    status = payment_status(row["total"], paid)
+    cur.execute("""
+        UPDATE reservations SET deposited=?, status=? WHERE id=?
+    """, (int(paid), status, int(reservation_id)))
+    return status
+
+
+def save_reservation(
+    department_id, guest, phone, check_in, check_in_time,
+    check_out, check_out_time, guests, price_night,
+    deposit_percent, status=None, reservation_id=None, *,
+    email="", document="", source="Directo", notes="",
+    initial_payment=0, payment_method="Transferencia",
+):
+    """Crea o actualiza una reserva.
+
+    ``deposited`` y ``status`` nunca se escriben a mano: se recalculan desde la
+    tabla de pagos. El porcentaje de abono solo define el monto esperado
+    (``deposit_due``).
+    """
+    nights = (check_out - check_in).days
+    if nights <= 0:
+        raise ValueError("El check-out debe ser posterior al check-in.")
+    total = nights * int(price_night)
+    deposit_due = min(total, round(total * (int(deposit_percent) / 100)))
+    conn = db()
+    try:
+        cur = conn.cursor()
+        if reservation_id:
+            cur.execute("""
+                UPDATE reservations
+                SET department_id=?, guest=?, guest_name=?, phone=?, check_in=?,
+                    check_in_time=?, check_out=?, check_out_time=?, guests=?,
+                    price_night=?, nights=?, total=?, deposit_percent=?,
+                    deposit_due=?, email=?, document=?, source=?, notes=?
+                WHERE id=?
+            """, (
+                int(department_id), guest.strip(), guest.strip(), phone.strip(),
+                check_in.isoformat(), check_in_time, check_out.isoformat(),
+                check_out_time, int(guests), int(price_night), nights, total,
+                int(deposit_percent), deposit_due, email.strip(), document.strip(),
+                source.strip() or "Directo", notes.strip(), int(reservation_id),
+            ))
+            recompute_reservation(cur, reservation_id)
+            rid = int(reservation_id)
+        else:
+            rid = cur.execute("""
+                INSERT INTO reservations
+                    (department_id, guest, guest_name, phone, check_in,
+                     check_in_time, check_out, check_out_time, guests,
+                     price_night, nights, total, deposit_percent, deposit_due,
+                     deposited, status, email, document, source, notes)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0, 'Sin abono',
+                        ?, ?, ?, ?)
+                RETURNING id
+            """, (
+                int(department_id), guest.strip(), guest.strip(), phone.strip(),
+                check_in.isoformat(), check_in_time, check_out.isoformat(),
+                check_out_time, int(guests), int(price_night), nights, total,
+                int(deposit_percent), deposit_due, email.strip(), document.strip(),
+                source.strip() or "Directo", notes.strip(),
+            )).fetchone()["id"]
+            cur.execute("""
+                INSERT INTO checklist (reservation_id, cleaning, internet, inspected, keys)
+                VALUES (?, 0, 0, 0, 0)
+                ON CONFLICT (reservation_id) DO NOTHING
+            """, (int(rid),))
+            if int(initial_payment or 0) > 0:
+                amount = min(int(initial_payment), total)
+                cur.execute("""
+                    INSERT INTO payments
+                        (reservation_id, amount, payment_date, note, method)
+                    VALUES (?, ?, ?, ?, ?)
+                """, (
+                    int(rid), amount, today_cl(), "Pago inicial de la reserva",
+                    payment_method.strip() or "Transferencia",
+                ))
+            recompute_reservation(cur, rid)
+        conn.commit()
+        return int(rid)
+    except psycopg2.errors.ExclusionViolation as exc:
+        conn.rollback()
+        raise ValueError(
+            "Las fechas se cruzan con otra reserva vigente de este departamento."
+        ) from exc
+    except psycopg2.errors.IntegrityError as exc:
+        conn.rollback()
+        raise ValueError(f"No se pudo guardar la reserva: {exc}") from exc
+    except Exception:
+        conn.rollback()
+        raise
+    finally:
+        conn.close()
+
+
+def delete_reservation(reservation_id):
+    """Elimina una reserva solo si no tiene pagos ni liquidaciones."""
+    conn = db()
+    try:
+        cur = conn.cursor()
+        row = cur.execute("""
+            SELECT
+                (SELECT COUNT(*) FROM payments WHERE reservation_id=?) AS payments,
+                (SELECT COUNT(*) FROM owner_liquidations WHERE reservation_id=?) AS liquidations
+        """, (reservation_id, reservation_id)).fetchone()
+        if row["payments"] or row["liquidations"]:
+            raise ValueError(
+                "La reserva tiene pagos o liquidaciones. Cancélala para conservar "
+                "el historial en lugar de eliminarla."
+            )
+        cur.execute("DELETE FROM checklist WHERE reservation_id=?", (reservation_id,))
+        cur.execute("DELETE FROM reservations WHERE id=?", (reservation_id,))
+        conn.commit()
+    except Exception:
+        conn.rollback()
+        raise
+    finally:
+        conn.close()
+
+
+def cancel_reservation(reservation_id, reason=""):
+    conn = db()
+    try:
+        conn.execute("""
+            UPDATE reservations
+            SET status='Cancelada', cancelled_at=NOW(), cancelled_reason=?
+            WHERE id=?
+        """, (reason.strip(), int(reservation_id)))
+        conn.commit()
+    except Exception:
+        conn.rollback()
+        raise
+    finally:
+        conn.close()
+
+
+def reactivate_reservation(reservation_id):
+    conn = db()
+    try:
+        cur = conn.cursor()
+        cur.execute("""
+            UPDATE reservations
+            SET status='Sin abono', cancelled_at=NULL, cancelled_reason=''
+            WHERE id=?
+        """, (int(reservation_id),))
+        recompute_reservation(cur, reservation_id)
+        conn.commit()
+    except Exception:
+        conn.rollback()
+        raise
+    finally:
+        conn.close()
+
+
+def update_checklist(reservation_id, cleaning, internet, inspected, keys):
+    """Guarda el checklist de preparación de una reserva."""
+    conn = db()
+    try:
+        conn.execute("""
+            INSERT INTO checklist
+            (reservation_id, cleaning, internet, inspected, keys)
+            VALUES (?, ?, ?, ?, ?)
+            ON CONFLICT(reservation_id)
+            DO UPDATE SET
+                cleaning=excluded.cleaning,
+                internet=excluded.internet,
+                inspected=excluded.inspected,
+                keys=excluded.keys
+        """, (
+            reservation_id,
+            int(cleaning),
+            int(internet),
+            int(inspected),
+            int(keys),
+        ))
+        conn.commit()
+    except Exception:
+        conn.rollback()
+        raise
+    finally:
+        conn.close()
 
 
 def get_checklist(reservation_id):
     conn = db()
-    row = conn.execute("""
-        SELECT * FROM checklist WHERE reservation_id=?
-    """, (reservation_id,)).fetchone()
-    conn.close()
-    return row
+    try:
+        return conn.execute("""
+            SELECT * FROM checklist WHERE reservation_id=?
+        """, (reservation_id,)).fetchone()
+    finally:
+        conn.close()
 
 
 def set_page(page, reservation_id=None):
     st.session_state.page = page
-    if page in ("Inicio", "Reservas", "Calendario", "Departamentos", "Liquidaciones", "Propietarios"):
+    if page in ("Inicio", "Reservas", "Calendario", "Departamentos",
+                "Propietarios", "Reportes", "Liquidaciones"):
         # Los accesos directos desde Detalle no deben volver accidentalmente a Inicio.
         st.session_state.nav_choice = page
     if reservation_id is not None:
@@ -1825,71 +1886,116 @@ def set_page(page, reservation_id=None):
             st.session_state.liq_view = "Preparar liquidación"
 
 
-def add_payment(reservation_id, amount, note):
+def add_payment(reservation_id, amount, note="", payment_date=None,
+                method="Transferencia", reference=""):
+    """Registra un pago real, sin permitir sobrepagos."""
+    amount = int(amount)
+    if amount <= 0:
+        raise ValueError("El monto del pago debe ser mayor que 0.")
     conn = db()
-    conn.execute("""
-        INSERT INTO payments
-        (reservation_id, amount, payment_date, note)
-        VALUES (?, ?, ?, ?)
-    """, (reservation_id, amount, date.today().isoformat(), note))
-    conn.execute("""
-        UPDATE reservations
-        SET deposited = deposited + ?
-        WHERE id=?
-    """, (amount, reservation_id))
+    try:
+        cur = conn.cursor()
+        row = cur.execute("""
+            SELECT id, total, status, deposited
+            FROM reservations WHERE id=? FOR UPDATE
+        """, (int(reservation_id),)).fetchone()
+        if not row:
+            raise ValueError("La reserva no existe.")
+        if row["status"] == STATUS_CANCELLED:
+            raise ValueError("No se pueden registrar pagos en una reserva cancelada.")
+        paid = cur.execute("""
+            SELECT COALESCE(SUM(amount), 0) AS paid
+            FROM payments WHERE reservation_id=? AND voided_at IS NULL
+        """, (int(reservation_id),)).fetchone()["paid"]
+        if int(paid) + amount > int(row["total"]):
+            raise ValueError(
+                f"El pago supera el saldo pendiente ({money(max(int(row['total']) - int(paid), 0))})."
+            )
+        cur.execute("""
+            INSERT INTO payments
+                (reservation_id, amount, payment_date, note, method, reference)
+            VALUES (?, ?, ?, ?, ?, ?)
+        """, (
+            int(reservation_id), amount, payment_date or today_cl(),
+            note.strip(), method.strip() or "Transferencia", reference.strip(),
+        ))
+        status = recompute_reservation(cur, reservation_id)
+        conn.commit()
+        return {
+            "amount": amount,
+            "status": status,
+            "paid": int(paid) + amount,
+            "balance": max(int(row["total"]) - int(paid) - amount, 0),
+        }
+    except Exception:
+        conn.rollback()
+        raise
+    finally:
+        conn.close()
 
-    row = conn.execute("""
-        SELECT total, deposited FROM reservations WHERE id=?
-    """, (reservation_id,)).fetchone()
 
-    status = "Pagado completamente" if row["deposited"] >= row["total"] else "Abono recibido"
-
-    conn.execute("""
-        UPDATE reservations SET status=? WHERE id=?
-    """, (status, reservation_id))
-
-    conn.commit()
-    conn.close()
+def void_payment(payment_id, reason=""):
+    """Anula un pago sin borrarlo y recalcula la reserva."""
+    conn = db()
+    try:
+        cur = conn.cursor()
+        payment = cur.execute("""
+            SELECT id, reservation_id, voided_at
+            FROM payments WHERE id=? FOR UPDATE
+        """, (int(payment_id),)).fetchone()
+        if not payment:
+            raise ValueError("El pago no existe.")
+        if payment["voided_at"]:
+            return
+        cur.execute("""
+            UPDATE payments
+            SET voided_at=NOW(), void_reason=?
+            WHERE id=?
+        """, (reason.strip(), int(payment_id)))
+        recompute_reservation(cur, payment["reservation_id"])
+        conn.commit()
+    except Exception:
+        conn.rollback()
+        raise
+    finally:
+        conn.close()
 
 
 def get_payments(reservation_id):
     conn = db()
-    rows = conn.execute("""
-        SELECT * FROM payments
-        WHERE reservation_id=?
-        ORDER BY payment_date DESC, id DESC
-    """, (reservation_id,)).fetchall()
-    conn.close()
-    return rows
+    try:
+        return conn.execute("""
+            SELECT * FROM payments
+            WHERE reservation_id=?
+            ORDER BY payment_date DESC, id DESC
+        """, (int(reservation_id),)).fetchall()
+    finally:
+        conn.close()
 
 
-def reminders_for(reservations):
-    today = date.today()
+def get_checklists_map():
+    """Carga todos los checklists en una sola consulta."""
+    conn = db()
+    try:
+        rows = conn.execute("SELECT * FROM checklist").fetchall()
+        return {int(row["reservation_id"]): row for row in rows}
+    finally:
+        conn.close()
+
+
+def reminders_for(reservations, checklists=None):
+    today = today_cl()
     reminders = []
-
-    # Antes se abría una conexión y se consultaba checklist por CADA reserva,
-    # incluso por reservas antiguas. Ahora consultamos solo las llegadas de mañana.
-    tomorrow_ids = [int(r["id"]) for r in reservations
-                    if date.fromisoformat(r["check_in"]) == today + timedelta(days=1)]
-    checklists = {}
-    if tomorrow_ids:
-        conn = db()
-        try:
-            rows = conn.execute(
-                "SELECT reservation_id, cleaning, internet "
-                "FROM checklist WHERE reservation_id = ANY(%s)",
-                (tomorrow_ids,),
-            ).fetchall()
-            checklists = {int(row["reservation_id"]): row for row in rows}
-        finally:
-            conn.close()
+    checklists = checklists if checklists is not None else get_checklists_map()
 
     for r in reservations:
-        ci = date.fromisoformat(r["check_in"])
-        co = date.fromisoformat(r["check_out"])
+        if r["status"] == STATUS_CANCELLED:
+            continue
+        ci = date.fromisoformat(str(r["check_in"])[:10])
+        co = date.fromisoformat(str(r["check_out"])[:10])
         days_to_in = (ci - today).days
         days_to_out = (co - today).days
-        checklist = checklists.get(int(r["id"])) if days_to_in == 1 else None
+        checklist = checklists.get(int(r["id"]))
 
         if days_to_in == 2:
             reminders.append((
@@ -1898,47 +2004,32 @@ def reminders_for(reservations):
                 f"{r['guest']} llega en 2 días a {r['dept_name']} · {r['condo']}",
                 r["id"]
             ))
-
         if days_to_in == 1:
             if not checklist or not checklist["cleaning"]:
                 reminders.append((
-                    "urgent",
-                    "Aseo pendiente",
-                    f"{r['dept_name']} recibe a {r['guest']} mañana.",
-                    r["id"]
+                    "urgent", "Aseo pendiente",
+                    f"{r['dept_name']} recibe a {r['guest']} mañana.", r["id"]
                 ))
             if not checklist or not checklist["internet"]:
                 reminders.append((
-                    "important",
-                    "Verificar internet",
-                    f"Revisar internet antes del check-in de {r['guest']}.",
-                    r["id"]
+                    "important", "Verificar internet",
+                    f"Revisar internet antes del check-in de {r['guest']}.", r["id"]
                 ))
-
         if days_to_out == 1:
             reminders.append((
-                "important",
-                "Check-out mañana",
-                f"Enviar instrucciones de salida a {r['guest']}.",
-                r["id"]
+                "important", "Check-out mañana",
+                f"Enviar instrucciones de salida a {r['guest']}.", r["id"]
             ))
-
         if days_to_in == 0:
             reminders.append((
-                "today",
-                "Check-in hoy",
-                f"{r['guest']} llega hoy a {r['dept_name']}.",
-                r["id"]
+                "today", "Check-in hoy",
+                f"{r['guest']} llega hoy a {r['dept_name']}.", r["id"]
             ))
-
         if days_to_out == 0:
             reminders.append((
-                "today",
-                "Check-out hoy",
-                f"{r['guest']} debe salir hoy de {r['dept_name']}.",
-                r["id"]
+                "today", "Check-out hoy",
+                f"{r['guest']} debe salir hoy de {r['dept_name']}.", r["id"]
             ))
-
     return reminders
 
 
@@ -1952,10 +2043,15 @@ if "page" not in st.session_state:
 if "selected_reservation" not in st.session_state:
     st.session_state.selected_reservation = None
 
-pages = ["Inicio", "Reservas", "Calendario", "Departamentos", "Liquidaciones"]
-if is_admin():
-    pages.append("Propietarios")
-
+pages = [
+    "Inicio",
+    "Reservas",
+    "Calendario",
+    "Departamentos",
+    "Propietarios",
+    "Reportes",
+    "Liquidaciones",
+]
 
 with st.sidebar:
     st.markdown('<div class="brand">🌸 Arriendos</div>', unsafe_allow_html=True)
@@ -1988,7 +2084,7 @@ with st.sidebar:
     st.divider()
 
     st.caption("Panel de administración")
-    st.caption(date.today().strftime("%d/%m/%Y"))
+    st.caption(today_cl().strftime("%d/%m/%Y"))
 
 # =========================================================
 # INICIO
@@ -2064,29 +2160,67 @@ def _archivo_a_data_uri(file_path):
         return None
 
 
-@st.cache_data(ttl=3600, max_entries=256, show_spinner=False)
-def _get_condo_image_cached(user_id, condo_key):
-    """Caché de imágenes por usuario para evitar mezclar accesos de propietarios."""
+def _make_thumbnail(image_bytes, size=(800, 800), quality=72):
+    """Genera una miniatura JPEG liviana para no enviar la foto completa."""
+    try:
+        from PIL import Image
+    except Exception:
+        return None
+
+    try:
+        with Image.open(BytesIO(image_bytes)) as image:
+            image = image.convert("RGB")
+            image.thumbnail(size, Image.LANCZOS)
+            buffer = BytesIO()
+            image.save(
+                buffer, format="JPEG", quality=quality, optimize=True,
+                progressive=True,
+            )
+            return buffer.getvalue()
+    except Exception:
+        return None
+
+
+@st.cache_data(ttl=3600, show_spinner=False)
+def _get_condo_image_cached(condo_key, thumb=True):
+    """Trae una foto de Supabase y la mantiene en caché para evitar descargas repetidas.
+
+    Por defecto usa la miniatura; si aún no existe, cae a la imagen original.
+    """
     if not condo_key:
         return None
 
     conn = db()
     try:
-        row = conn.execute(
-            "SELECT image_data, image_mime FROM condo_images WHERE condo_key=?",
-            (condo_key,)
-        ).fetchone()
-        if not row or not row["image_data"]:
+        if thumb:
+            row = conn.execute(
+                """
+                SELECT thumb_data, thumb_mime, image_data, image_mime
+                FROM condo_images WHERE condo_key=?
+                """,
+                (condo_key,),
+            ).fetchone()
+        else:
+            row = conn.execute(
+                "SELECT image_data, image_mime FROM condo_images WHERE condo_key=?",
+                (condo_key,),
+            ).fetchone()
+
+        if not row:
             return None
-        return bytes(row["image_data"]), (row["image_mime"] or "image/jpeg")
+
+        if thumb and row.get("thumb_data"):
+            return bytes(row["thumb_data"]), (row["thumb_mime"] or "image/jpeg")
+        if row.get("image_data"):
+            return bytes(row["image_data"]), (row["image_mime"] or "image/jpeg")
+        return None
     finally:
         conn.close()
 
 
-def _get_condo_image_row(condo):
-    """Compatibilidad: devuelve los bytes/mime cacheados del edificio."""
-    return _get_condo_image_cached(str(st.session_state["auth_uid"]),
-                                   _slug_archivo(condo))
+def _get_condo_image_row(condo, thumb=True):
+    """Devuelve los bytes/mime cacheados del edificio."""
+    return _get_condo_image_cached(_slug_archivo(condo), thumb)
 
 
 def _condo_has_saved_image(condo):
@@ -2117,20 +2251,30 @@ def save_condo_image(condo, uploaded_file):
     if not condo_key:
         raise ValueError("Escribe primero el nombre del edificio.")
 
+    thumb_bytes = _make_thumbnail(image_bytes)
+    thumb_mime = "image/jpeg" if thumb_bytes else None
+
     conn = db()
     try:
         conn.execute(
             """
             INSERT INTO condo_images
-            (condo_key, condo_name, image_data, image_mime, updated_at)
-            VALUES (?, ?, ?, ?, NOW())
+                (condo_key, condo_name, image_data, image_mime,
+                 thumb_data, thumb_mime, updated_at)
+            VALUES (?, ?, ?, ?, ?, ?, NOW())
             ON CONFLICT(condo_key) DO UPDATE SET
                 condo_name=EXCLUDED.condo_name,
                 image_data=EXCLUDED.image_data,
                 image_mime=EXCLUDED.image_mime,
+                thumb_data=EXCLUDED.thumb_data,
+                thumb_mime=EXCLUDED.thumb_mime,
                 updated_at=NOW()
             """,
-            (condo_key, condo_name, psycopg2.Binary(image_bytes), mime)
+            (
+                condo_key, condo_name, psycopg2.Binary(image_bytes), mime,
+                psycopg2.Binary(thumb_bytes) if thumb_bytes else None,
+                thumb_mime,
+            ),
         )
         conn.commit()
         _get_condo_image_cached.clear()
@@ -2237,8 +2381,7 @@ def page_section_header(title, subtitle, kicker="Gestión de arriendos temporale
 
 def page_inicio():
     reservations = get_reservations()
-    today = date.today()
-
+    today = today_cl()
     # Portada: busca automáticamente cualquier imagen cuyo nombre comience con "portada".
     image_uri = _portada_data_uri()
 
@@ -2282,7 +2425,7 @@ def page_inicio():
 
     income = sum(r["total"] for r in month_res)
     nights = sum(r["nights"] for r in month_res)
-    pending = sum(max(r["total"] - r["deposited"], 0) for r in month_res)
+    pending = sum(max(r["total"] - r["paid"], 0) for r in month_res)
 
     c1, c2, c3, c4 = st.columns(4)
 
@@ -2351,9 +2494,9 @@ def page_inicio():
                     f"""
                     <div class="reservation-card">
                         <span class="reservation-tag">Próximo arriendo</span>
-                        <div class="reservation-name">{html_escape(str(r['guest']))}</div>
+                        <div class="reservation-name">{esc(r['guest'])}</div>
                         <div class="reservation-info">
-                            🏢 {html_escape(str(r['dept_name']))} · {html_escape(str(r['condo']))}<br>
+                            🏢 {esc(r['dept_name'])} · {esc(r['condo'])}<br>
                             📅 {fecha_corta_espanol(ci)} → {fecha_corta_espanol(co)} {co.year}<br>
                             👥 {r['guests']} huéspedes · 🌙 {r['nights']} noches
                         </div>
@@ -2372,7 +2515,7 @@ def page_inicio():
 
     st.markdown('<div class="section-title">🔔 Recordatorios</div>', unsafe_allow_html=True)
 
-    reminders = reminders_for(reservations)
+    reminders = reminders_for(reservations, get_checklists_map())
 
     if not reminders:
         st.success("Todo al día. No tienes recordatorios pendientes para hoy.")
@@ -2381,8 +2524,8 @@ def page_inicio():
         st.markdown(
             f"""
             <div class="reminder">
-                <div class="reminder-title">{html_escape(title)}</div>
-                <div class="reminder-text">{html_escape(text_value)}</div>
+                <div class="reminder-title">{esc(title)}</div>
+                <div class="reminder-text">{esc(text_value)}</div>
             </div>
             """,
             unsafe_allow_html=True
@@ -2433,7 +2576,7 @@ def page_reservas():
             phone = st.text_input("Teléfono / contacto", key="new_phone")
             check_in = st.date_input(
                 "Entrada",
-                value=date.today(),
+                value=today_cl(),
                 key="new_checkin"
             )
             check_in_time = st.time_input(
@@ -2448,11 +2591,11 @@ def page_reservas():
                 min_value=1,
                 max_value=int(selected_dept["capacity"]),
                 value=1,
-                key="new_guests"
+                key=f"new_guests_{selected_dept['id']}"
             )
             check_out = st.date_input(
                 "Salida",
-                value=date.today() + timedelta(days=1),
+                value=today_cl() + timedelta(days=1),
                 key="new_checkout"
             )
             check_out_time = st.time_input(
@@ -2461,12 +2604,35 @@ def page_reservas():
                 key="new_checkout_time"
             )
 
+        season_price = season_price_for(
+            get_seasons(selected_dept["id"], selected_dept["condo"]),
+            check_in,
+            selected_dept["id"],
+            selected_dept["condo"],
+        )
+        suggested_prices = {"Verano": int(selected_dept["summer_price"])}
+        if int(selected_dept["winter_price"]) != int(selected_dept["summer_price"]):
+            suggested_prices["Invierno"] = int(selected_dept["winter_price"])
+        if season_price is not None:
+            suggested_prices["Temporada"] = int(season_price)
+
+        price_source = st.radio(
+            "Precio sugerido",
+            list(suggested_prices.keys()),
+            horizontal=True,
+            key=f"new_price_source_{selected_dept['id']}",
+            help=(
+                "Elige una referencia y luego ajusta el valor si hace falta. "
+                "«Temporada» aparece solo si hay una temporada configurada."
+            ),
+        )
+
         price = st.number_input(
             "Precio por noche",
             min_value=0,
-            value=int(selected_dept["summer_price"]),
+            value=int(suggested_prices[price_source]),
             step=5000,
-            key="new_price"
+            key=f"new_price_{selected_dept['id']}_{price_source}"
         )
 
         deposit_percent = st.slider(
@@ -2491,6 +2657,23 @@ def page_reservas():
             balance = 0
             st.error("El check-out debe ser posterior al check-in.")
 
+        initial_payment = st.number_input(
+            "Pago inicial realmente recibido (opcional)",
+            min_value=0,
+            max_value=max(int(total), 0),
+            value=min(int(deposit), int(total)) if valid_dates else 0,
+            step=5000,
+            key=(
+                "new_initial_payment_"
+                f"{selected_dept['id']}_{check_in}_{check_out}_"
+                f"{int(price)}_{int(deposit_percent)}"
+            ),
+            help=(
+                "Se guardará como un pago en el historial. Si todavía no has "
+                "recibido dinero, déjalo en 0."
+            ),
+        )
+
         # Los cálculos se muestran mientras completas la reserva,
         # pero NO se comprueba disponibilidad todavía.
         st.markdown(
@@ -2505,8 +2688,12 @@ def page_reservas():
                     <div class="payment-card-value">{money(total)}</div>
                 </div>
                 <div class="payment-card">
-                    <div class="payment-card-label">ABONO</div>
+                    <div class="payment-card-label">ABONO ESPERADO</div>
                     <div class="payment-card-value">{money(deposit)}</div>
+                </div>
+                <div class="payment-card">
+                    <div class="payment-card-label">PAGO INICIAL</div>
+                    <div class="payment-card-value">{money(initial_payment)}</div>
                 </div>
                 <div class="payment-card">
                     <div class="payment-card-label">SALDO INICIAL</div>
@@ -2528,6 +2715,7 @@ def page_reservas():
             int(guests),
             int(price),
             int(deposit_percent),
+            int(initial_payment),
         )
 
         reviewed = st.session_state.get("reservation_review")
@@ -2572,6 +2760,7 @@ def page_reservas():
                     "guests": int(guests),
                     "price": int(price),
                     "deposit_percent": int(deposit_percent),
+                    "initial_payment": int(initial_payment),
                     "nights": nights,
                     "total": total,
                     "deposit": deposit,
@@ -2591,11 +2780,11 @@ def page_reservas():
                 f"""
                 <div class="detail-box">
                     <div class="detail-label">HUÉSPED</div>
-                    <div class="detail-value">{html_escape(reviewed["guest"])}</div><br>
+                    <div class="detail-value">{esc(reviewed["guest"])}</div><br>
                     <div class="detail-label">CONTACTO</div>
-                    <div class="detail-value">{html_escape(reviewed["phone"] or "No registrado")}</div><br>
+                    <div class="detail-value">{esc(reviewed["phone"] or "No registrado")}</div><br>
                     <div class="detail-label">DEPARTAMENTO</div>
-                    <div class="detail-value">🏢 {html_escape(reviewed["condo"])} · {html_escape(reviewed["dept_name"])}</div><br>
+                    <div class="detail-value">🏢 {esc(reviewed["condo"])} · {esc(reviewed["dept_name"])}</div><br>
                     <div class="detail-label">ESTADÍA</div>
                     <div class="detail-value">
                         {reviewed["check_in"].strftime("%d/%m/%Y")} · {reviewed["check_in_time"].strftime("%H:%M")}
@@ -2620,12 +2809,16 @@ def page_reservas():
                         <div class="payment-card-value">{money(reviewed["total"])}</div>
                     </div>
                     <div class="payment-card">
-                        <div class="payment-card-label">ABONO</div>
+                        <div class="payment-card-label">ABONO ESPERADO</div>
                         <div class="payment-card-value">{money(reviewed["deposit"])}</div>
                     </div>
                     <div class="payment-card">
+                        <div class="payment-card-label">PAGO INICIAL</div>
+                        <div class="payment-card-value">{money(reviewed["initial_payment"])}</div>
+                    </div>
+                    <div class="payment-card">
                         <div class="payment-card-label">SALDO INICIAL</div>
-                        <div class="payment-card-value">{money(reviewed["balance"])}</div>
+                        <div class="payment-card-value">{money(reviewed["balance"] - reviewed["initial_payment"])}</div>
                     </div>
                 </div>
                 """,
@@ -2643,14 +2836,25 @@ def page_reservas():
                     use_container_width=True,
                     key="confirm_reservation"
                 ):
-                    # Última comprobación visual; PostgreSQL evita cruces simultáneos.
+                    # Última comprobación, justo antes de escribir en SQLite.
                     conflict = conflict_exists(
                         reviewed["department_id"],
                         reviewed["check_in"],
                         reviewed["check_out"]
                     )
+                    block = block_conflict_exists(
+                        reviewed["department_id"],
+                        reviewed["check_in"],
+                        reviewed["check_out"]
+                    )
 
-                    if conflict:
+                    if block:
+                        st.error(
+                            "❌ No se puede guardar. El departamento está bloqueado por "
+                            f"mantención: {block['reason']} "
+                            f"({block['start_date']:%d/%m/%Y} al {block['end_date']:%d/%m/%Y})."
+                        )
+                    elif conflict:
                         st.error(
                             f"❌ No se puede guardar. El departamento ya está reservado "
                             f"por {conflict['guest']} desde "
@@ -2670,18 +2874,18 @@ def page_reservas():
                                 reviewed["guests"],
                                 reviewed["price"],
                                 reviewed["deposit_percent"],
-                                "Pagado completamente" if reviewed["deposit_percent"] == 100 else (
-                                    "Sin abono" if reviewed["deposit_percent"] == 0 else "Abono recibido"
-                                )
+                                None,
+                                initial_payment=reviewed["initial_payment"],
                             )
-                        except psycopg2.errors.ExclusionViolation:
-                            st.error("Otro usuario reservó esas fechas antes. Revisa el calendario.")
-                        except Exception:
-                            st.error("No fue posible confirmar la reserva. Revisa disponibilidad y permisos.")
+                        except ValueError as exc:
+                            st.error(f"No se pudo guardar la reserva: {exc}")
+                        except Exception as exc:
+                            st.error(f"Error inesperado al guardar la reserva: {exc}")
                         else:
                             st.session_state.reservation_review = None
                             st.session_state.selected_reservation = rid
-                            st.success("Reserva confirmada y compartida en ambos calendarios.")
+                            st.session_state.page = "Detalle"
+                            st.success("Reserva guardada correctamente.")
                             st.rerun()
 
             with cancel_col:
@@ -2696,9 +2900,19 @@ def page_reservas():
     with tab_list:
         reservations = get_reservations()
 
+        if not reservations:
+            st.info("Todavía no hay reservas registradas.")
+
         for r in reservations:
-            ci = date.fromisoformat(r["check_in"])
-            co = date.fromisoformat(r["check_out"])
+            ci = date.fromisoformat(str(r["check_in"])[:10])
+            co = date.fromisoformat(str(r["check_out"])[:10])
+            paid = int(r["paid"] or 0)
+            balance = max(int(r["total"]) - paid, 0)
+            pill = (
+                "ok" if r["status"] == STATUS_PAID
+                else "warn" if paid > 0
+                else ""
+            )
 
             col1, col2 = st.columns([5, 1])
 
@@ -2706,10 +2920,17 @@ def page_reservas():
                 st.markdown(
                     f"""
                     <div class="detail-box compact">
-                        <b>{html_escape(str(r['guest']))}</b><br>
+                        <div style="display:flex;justify-content:space-between;gap:8px;flex-wrap:wrap;align-items:center">
+                            <b>{esc(r['guest'])}</b>
+                            <span class="status-pill {pill}">{esc(r['status'])}</span>
+                        </div>
                         <span style="color:{MUTED}">
-                        {r['condo']} · {r['dept_name']} ·
+                        {esc(r['condo'])} · {esc(r['dept_name'])} ·
                         {ci.strftime('%d/%m/%Y')} → {co.strftime('%d/%m/%Y')}
+                        </span><br>
+                        <span style="color:{MUTED};font-size:.85rem">
+                        Total {money(r['total'])} · Pagado {money(paid)} ·
+                        Saldo {money(balance)}
                         </span>
                     </div>
                     """,
@@ -2755,17 +2976,35 @@ def page_detalle():
     )
 
     st.markdown('<div class="main-title">Detalle de reserva</div>', unsafe_allow_html=True)
+
+    payments = get_payments(rid)
+    paid = sum(int(p["amount"]) for p in payments if not p["voided_at"])
+    balance = max(int(r["total"]) - paid, 0)
+    deposit_due = int(r["deposit_due"] or 0)
+    cancelled = r["status"] == STATUS_CANCELLED
+
+    status_css = (
+        "ok" if r["status"] == STATUS_PAID
+        else "danger" if cancelled
+        else "warn"
+    )
     st.markdown(
         f"""<div class="reservation-heading">
-            <span class="reservation-heading-guest">{html_escape(str(r['guest']))}</span>
-            <span class="reservation-heading-place">🏢 {html_escape(str(r['condo']))} · {html_escape(str(r['dept_name']))}</span>
+            <span class="reservation-heading-guest">{esc(r['guest'])}</span>
+            <span class="reservation-heading-place">🏢 {esc(r['condo'])} · {esc(r['dept_name'])}</span>
+            <span class="status-pill {status_css}">{esc(r['status'])}</span>
         </div>""",
         unsafe_allow_html=True
     )
 
-    ci = date.fromisoformat(r["check_in"])
-    co = date.fromisoformat(r["check_out"])
-    balance = max(r["total"] - r["deposited"], 0)
+    ci = date.fromisoformat(str(r["check_in"])[:10])
+    co = date.fromisoformat(str(r["check_out"])[:10])
+
+    if cancelled:
+        st.warning(
+            "Esta reserva está cancelada y sus fechas quedaron liberadas. "
+            f"Motivo: {r['cancelled_reason'] or 'sin detalle'}"
+        )
 
     st.markdown('<div class="section-title">Información</div>', unsafe_allow_html=True)
 
@@ -2776,11 +3015,13 @@ def page_detalle():
             f"""
             <div class="detail-box compact">
                 <div class="detail-label">HUÉSPED</div>
-                <div class="detail-value">{html_escape(str(r['guest']))}</div><br>
+                <div class="detail-value">{esc(r['guest'])}</div><br>
                 <div class="detail-label">CONTACTO</div>
-                <div class="detail-value">{html_escape(str(r['phone'] or 'No registrado'))}</div><br>
+                <div class="detail-value">{esc(r['phone'] or 'No registrado')}</div><br>
                 <div class="detail-label">DEPARTAMENTO</div>
-                <div class="detail-value">{html_escape(str(r['condo']))} · {html_escape(str(r['dept_name']))}</div>
+                <div class="detail-value">{esc(r['condo'])} · {esc(r['dept_name'])}</div><br>
+                <div class="detail-label">PROPIETARIO</div>
+                <div class="detail-value">{esc(r['owner_display_name'] or 'Sin asignar')}</div>
             </div>
             """,
             unsafe_allow_html=True
@@ -2791,24 +3032,15 @@ def page_detalle():
             f"""
             <div class="detail-box">
                 <div class="detail-label">CHECK-IN</div>
-                <div class="detail-value">{ci.strftime('%d/%m/%Y')} · {r['check_in_time']}</div><br>
+                <div class="detail-value">{ci.strftime('%d/%m/%Y')} · {esc(r['check_in_time'])}</div><br>
                 <div class="detail-label">CHECK-OUT</div>
-                <div class="detail-value">{co.strftime('%d/%m/%Y')} · {r['check_out_time']}</div><br>
-                <div class="detail-label">CAPACIDAD DEL DEPARTAMENTO</div>
-                <div class="detail-value">{r['capacity']} huéspedes</div>
+                <div class="detail-value">{co.strftime('%d/%m/%Y')} · {esc(r['check_out_time'])}</div><br>
+                <div class="detail-label">HUÉSPEDES / ORIGEN</div>
+                <div class="detail-value">{r['guests']} huéspedes · {esc(r['source'] or 'Directo')}</div>
             </div>
             """,
             unsafe_allow_html=True
         )
-
-    if not is_admin():
-        st.markdown('<div class="section-title">Estado de la reserva</div>', unsafe_allow_html=True)
-        c1, c2, c3 = st.columns(3)
-        c1.metric("Total", money(r["total"]))
-        c2.metric("Abonado", money(r["deposited"]))
-        c3.metric("Saldo", money(balance))
-        st.caption("La administradora gestiona pagos, modificaciones y liquidaciones.")
-        return
 
     st.button(
         "Crear o consultar liquidación del propietario",
@@ -2819,17 +3051,20 @@ def page_detalle():
 
     st.markdown('<div class="section-title payment-section">💳 Pagos</div>', unsafe_allow_html=True)
 
-    # Resumen personalizado para mantener el diseño rosado/fucsia.
     st.markdown(
         f"""
         <div class="payment-summary">
             <div class="payment-card">
-                <div class="payment-card-label">TOTAL</div>
+                <div class="payment-card-label">TOTAL RESERVA</div>
                 <div class="payment-card-value">{money(r["total"])}</div>
             </div>
             <div class="payment-card">
-                <div class="payment-card-label">ABONADO</div>
-                <div class="payment-card-value">{money(r["deposited"])}</div>
+                <div class="payment-card-label">PAGADO</div>
+                <div class="payment-card-value">{money(paid)}</div>
+            </div>
+            <div class="payment-card">
+                <div class="payment-card-label">ABONO ESPERADO</div>
+                <div class="payment-card-value">{money(deposit_due)}</div>
             </div>
             <div class="payment-card">
                 <div class="payment-card-label">SALDO</div>
@@ -2840,49 +3075,106 @@ def page_detalle():
         unsafe_allow_html=True
     )
 
-    st.markdown(
-        f'<div class="payment-status"><b>{r["status"]}</b> · Abono configurado: {r["deposit_percent"]:.0f}%</div>',
-        unsafe_allow_html=True
+    st.caption(
+        f"El abono esperado se calculó con {float(r['deposit_percent']):.0f}% del total. "
+        "El estado se actualiza solo con pagos registrados."
     )
 
-    with st.expander("＋ Registrar pago", expanded=False):
-        pay1, pay2 = st.columns(2)
-        with pay1:
-            amount = st.number_input(
-                "Monto del pago",
-                min_value=0,
-                step=5000,
-                key=f"pay_amount_{rid}"
-            )
-        with pay2:
-            note = st.text_input(
-                "Nota (opcional)",
-                key=f"pay_note_{rid}"
-            )
+    if not cancelled:
+        with st.expander("＋ Registrar pago", expanded=False):
+            pay1, pay2, pay3 = st.columns([1, 1, 1])
+            with pay1:
+                amount = st.number_input(
+                    "Monto del pago",
+                    min_value=0,
+                    max_value=max(balance, 0),
+                    value=min(5000, max(balance, 0)),
+                    step=5000,
+                    key=f"pay_amount_{rid}_{paid}",
+                )
+            with pay2:
+                payment_date = st.date_input(
+                    "Fecha del pago",
+                    value=today_cl(),
+                    key=f"pay_date_{rid}",
+                )
+            with pay3:
+                method = st.selectbox(
+                    "Medio de pago",
+                    ["Transferencia", "Efectivo", "Tarjeta", "Depósito", "Otro"],
+                    key=f"pay_method_{rid}",
+                )
+            pay4, pay5 = st.columns(2)
+            with pay4:
+                reference = st.text_input(
+                    "Referencia / comprobante (opcional)",
+                    key=f"pay_ref_{rid}",
+                )
+            with pay5:
+                note = st.text_input(
+                    "Nota (opcional)",
+                    key=f"pay_note_{rid}",
+                )
 
-        if st.button(
-            "Registrar pago",
-            type="primary",
-            use_container_width=True,
-            key=f"save_pay_{rid}"
-        ):
-            if amount <= 0:
-                st.warning("Ingresa un monto mayor a 0.")
-            else:
-                add_payment(rid, amount, note)
-                st.success("Pago registrado.")
-                st.rerun()
-
-    payments = get_payments(rid)
+            if st.button(
+                "Registrar pago",
+                type="primary",
+                use_container_width=True,
+                key=f"save_pay_{rid}",
+                disabled=balance <= 0,
+            ):
+                try:
+                    add_payment(
+                        rid, amount, note, payment_date, method, reference
+                    )
+                except ValueError as exc:
+                    st.error(str(exc))
+                else:
+                    st.success("Pago registrado y saldo actualizado.")
+                    st.rerun()
 
     if payments:
-        st.markdown('<div class="payment-history-title">Historial de pagos</div>', unsafe_allow_html=True)
+        st.markdown(
+            '<div class="payment-history-title">Historial de pagos</div>',
+            unsafe_allow_html=True,
+        )
         for p in payments:
-            note_text = f' · {p["note"]}' if p["note"] else ''
+            payment_day = p["payment_date"]
+            if hasattr(payment_day, "strftime"):
+                payment_day = payment_day.strftime("%d/%m/%Y")
+            note_text = f' · {esc(p["note"])}' if p["note"] else ""
+            ref_text = f' · Ref. {esc(p["reference"])}' if p["reference"] else ""
+            voided = bool(p["voided_at"])
+            void_label = " · ANULADO" if voided else ""
             st.markdown(
-                f'<div class="payment-row"><span>{p["payment_date"]}</span><strong>{money(p["amount"])}</strong><span>{note_text}</span></div>',
-                unsafe_allow_html=True
+                f'<div class="payment-row{" voided" if voided else ""}">'
+                f'<span>{payment_day} · {esc(p["method"] or "Transferencia")}</span>'
+                f'<strong>{money(p["amount"])}</strong>'
+                f'<span>{note_text}{ref_text}{void_label}</span></div>',
+                unsafe_allow_html=True,
             )
+            if not voided:
+                with st.popover("Anular este pago", use_container_width=False):
+                    st.caption(
+                        "El pago no se borra: queda marcado como anulado para "
+                        "mantener el historial."
+                    )
+                    void_reason = st.text_input(
+                        "Motivo de la anulación",
+                        key=f"void_reason_{p['id']}",
+                    )
+                    if st.button(
+                        "Confirmar anulación",
+                        key=f"void_btn_{p['id']}",
+                        type="primary",
+                    ):
+                        try:
+                            void_payment(p["id"], void_reason)
+                        except ValueError as exc:
+                            st.error(str(exc))
+                        else:
+                            st.success("Pago anulado y saldo recalculado.")
+                            st.rerun()
 
     st.markdown('<div class="section-title">🧹 Preparación del departamento</div>', unsafe_allow_html=True)
 
@@ -2917,8 +3209,13 @@ def page_detalle():
         type="primary",
         key=f"save_check_{rid}"
     ):
-        update_checklist(rid, cleaning, internet, inspected, keys)
-        st.success("Checklist actualizado.")
+        try:
+            update_checklist(rid, cleaning, internet, inspected, keys)
+        except Exception as exc:
+            st.error(f"No se pudo guardar el checklist: {exc}")
+        else:
+            st.success("Checklist actualizado.")
+            st.rerun()
 
     st.markdown('<div class="section-title">✏️ Editar reserva</div>', unsafe_allow_html=True)
 
@@ -2952,6 +3249,11 @@ def page_detalle():
                 value=r["phone"],
                 key=f"edit_phone_{rid}"
             )
+            edit_email = st.text_input(
+                "Email",
+                value=r["email"] or "",
+                key=f"edit_email_{rid}"
+            )
             edit_checkin = st.date_input(
                 "Entrada",
                 value=ci,
@@ -2969,7 +3271,7 @@ def page_detalle():
                 min_value=1,
                 max_value=int(ed["capacity"]),
                 value=min(int(r["guests"]), int(ed["capacity"])),
-                key=f"edit_guests_{rid}"
+                key=f"edit_guests_{rid}_{ed['id']}"
             )
             edit_price = st.number_input(
                 "Precio por noche",
@@ -2987,94 +3289,154 @@ def page_detalle():
             key=f"edit_dep_{rid}"
         )
 
+        edit_source_options = ["Directo", "Booking", "Airbnb", "WhatsApp", "Otro"]
+        current_source = r["source"] or "Directo"
+        edit_source = st.selectbox(
+            "Origen de la reserva",
+            edit_source_options,
+            index=(
+                edit_source_options.index(current_source)
+                if current_source in edit_source_options else 0
+            ),
+            key=f"edit_source_{rid}",
+        )
+        edit_notes = st.text_area(
+            "Notas internas",
+            value=r["notes"] or "",
+            key=f"edit_notes_{rid}",
+        )
+
+        st.caption(
+            "El porcentaje de abono solo define el monto esperado. "
+            "El estado y lo pagado se calculan desde el historial de pagos."
+        )
+
         if edit_checkout <= edit_checkin:
             st.error("El check-out debe ser posterior al check-in.")
         else:
             edit_conflict = conflict_exists(
                 ed["id"], edit_checkin, edit_checkout, ignore_id=rid
             )
+            edit_block = block_conflict_exists(
+                ed["id"], edit_checkin, edit_checkout
+            )
 
-            if edit_conflict:
+            if edit_block:
+                st.error(
+                    "Las fechas chocan con un bloqueo por mantención: "
+                    f"{edit_block['reason']}."
+                )
+            elif edit_conflict:
                 st.error("Las fechas chocan con otra reserva de este departamento.")
 
             if st.button(
                 "Guardar cambios",
                 type="primary",
                 key=f"edit_save_{rid}",
-                disabled=bool(edit_conflict)
+                disabled=bool(edit_conflict or edit_block),
             ):
-                nights = (edit_checkout - edit_checkin).days
-                total = nights * edit_price
-                deposited = int(r["deposited"])
+                try:
+                    save_reservation(
+                        ed["id"], edit_guest, edit_phone,
+                        edit_checkin, r["check_in_time"],
+                        edit_checkout, r["check_out_time"],
+                        edit_guests, edit_price, edit_deposit,
+                        None, rid,
+                        email=edit_email,
+                        source=edit_source,
+                        notes=edit_notes,
+                    )
+                except ValueError as exc:
+                    st.error(str(exc))
+                except Exception as exc:
+                    st.error(f"No se pudo actualizar la reserva: {exc}")
+                else:
+                    st.success("Reserva actualizada.")
+                    st.rerun()
 
-                if deposited > total:
-                    deposited = total
 
-                status = (
-                    "Pagado completamente"
-                    if deposited >= total
-                    else ("Sin abono" if deposited == 0 else "Abono recibido")
-                )
+    # -----------------------------------------------------
+    # CANCELAR / ELIMINAR
+    # -----------------------------------------------------
+    st.markdown('<div class="section-title">Cancelar o eliminar</div>', unsafe_allow_html=True)
 
-                conn = db()
-                conn.execute("""
-                    UPDATE reservations
-                    SET department_id=?, guest=?, phone=?,
-                        check_in=?, check_out=?, guests=?,
-                        price_night=?, nights=?, total=?,
-                        deposit_percent=?, deposited=?, status=?
-                    WHERE id=?
-                """, (
-                    ed["id"], edit_guest, edit_phone,
-                    edit_checkin.isoformat(), edit_checkout.isoformat(),
-                    edit_guests, edit_price, nights, total,
-                    edit_deposit, deposited, status, rid
-                ))
-                conn.commit()
-                conn.close()
-
-                st.success("Reserva actualizada.")
+    if cancelled:
+        if st.button("Reactivar reserva", key=f"reactivate_{rid}"):
+            try:
+                reactivate_reservation(rid)
+            except Exception as exc:
+                st.error(f"No se pudo reactivar la reserva: {exc}")
+            else:
+                st.success("Reserva reactivada. Revisa que las fechas sigan disponibles.")
                 st.rerun()
-
-
-    # -----------------------------------------------------
-    # ELIMINAR RESERVA
-    # -----------------------------------------------------
-    st.markdown('<div class="danger-zone"></div>', unsafe_allow_html=True)
-
-    if st.button(
-        "🗑️ Eliminar reserva",
-        key=f"delete_reservation_{rid}",
-    ):
-        st.session_state[f"confirm_delete_{rid}"] = True
-        st.rerun()
-
-    if st.session_state.get(f"confirm_delete_{rid}", False):
-        st.warning(
-            f"Vas a eliminar la reserva de {r['guest']} ({r['condo']} · {r['dept_name']}). "
-            "También se eliminarán sus pagos y checklist. Esta acción no se puede deshacer."
-        )
-        dc1, dc2 = st.columns(2)
-        with dc1:
+    else:
+        with st.expander("Cancelar reserva (conserva el historial)"):
+            st.caption(
+                "Al cancelar, las fechas se liberan para nuevas reservas, pero se "
+                "mantienen los pagos y las liquidaciones asociadas."
+            )
+            cancel_reason = st.text_input(
+                "Motivo de la cancelación",
+                key=f"cancel_reason_{rid}",
+                placeholder="Ej.: el huésped no pudo viajar",
+            )
             if st.button(
-                "Sí, eliminar reserva",
-                key=f"confirm_delete_yes_{rid}",
+                "Confirmar cancelación",
+                key=f"confirm_cancel_{rid}",
                 type="primary",
-                use_container_width=True
             ):
-                delete_reservation(rid)
-                st.session_state.pop(f"confirm_delete_{rid}", None)
-                st.session_state.pop("selected_reservation", None)
-                st.session_state.page = "Reservas"
-                st.rerun()
-        with dc2:
-            if st.button(
-                "Cancelar",
-                key=f"confirm_delete_no_{rid}",
-                use_container_width=True
-            ):
-                st.session_state.pop(f"confirm_delete_{rid}", None)
-                st.rerun()
+                try:
+                    cancel_reservation(rid, cancel_reason)
+                except Exception as exc:
+                    st.error(f"No se pudo cancelar la reserva: {exc}")
+                else:
+                    st.success("Reserva cancelada y fechas liberadas.")
+                    st.rerun()
+
+    with st.expander("Eliminar definitivamente"):
+        st.caption(
+            "Solo se permite eliminar reservas sin pagos ni liquidaciones. "
+            "Si ya hay dinero registrado, usa la cancelación para no perder el historial."
+        )
+        if st.button(
+            "🗑️ Eliminar definitivamente",
+            key=f"delete_reservation_{rid}",
+        ):
+            st.session_state[f"confirm_delete_{rid}"] = True
+            st.rerun()
+
+        if st.session_state.get(f"confirm_delete_{rid}", False):
+            st.warning(
+                f"Vas a eliminar la reserva de {r['guest']} "
+                f"({r['condo']} · {r['dept_name']}). Esta acción no se puede deshacer."
+            )
+            dc1, dc2 = st.columns(2)
+            with dc1:
+                if st.button(
+                    "Sí, eliminar reserva",
+                    key=f"confirm_delete_yes_{rid}",
+                    type="primary",
+                    use_container_width=True,
+                ):
+                    try:
+                        delete_reservation(rid)
+                    except ValueError as exc:
+                        st.error(str(exc))
+                    except Exception as exc:
+                        st.error(f"No se pudo eliminar la reserva: {exc}")
+                    else:
+                        st.session_state.pop(f"confirm_delete_{rid}", None)
+                        st.session_state.pop("selected_reservation", None)
+                        st.session_state.page = "Reservas"
+                        st.rerun()
+            with dc2:
+                if st.button(
+                    "Cancelar",
+                    key=f"confirm_delete_no_{rid}",
+                    use_container_width=True,
+                ):
+                    st.session_state.pop(f"confirm_delete_{rid}", None)
+                    st.rerun()
 
 
 # =========================================================
@@ -3089,6 +3451,7 @@ def page_calendario():
 
     departments = get_departments()
     reservations = get_reservations()
+    blocks = get_blocks()
 
     condos = sorted({d["condo"] for d in departments})
 
@@ -3122,14 +3485,14 @@ def page_calendario():
             "Año",
             min_value=2025,
             max_value=2035,
-            value=date.today().year
+            value=today_cl().year
         )
 
     with c2:
         month = st.selectbox(
             "Mes",
             list(range(1, 13)),
-            index=date.today().month - 1,
+            index=today_cl().month - 1,
             format_func=lambda x: _MESES[x - 1].capitalize()
         )
 
@@ -3144,6 +3507,8 @@ def page_calendario():
         <span class="availability-free">Disponible</span>
         &nbsp;&nbsp;
         <span class="availability-busy">Reservado</span>
+        &nbsp;&nbsp;
+        <span class="availability-blocked">Mantención</span>
         """,
         unsafe_allow_html=True
     )
@@ -3152,7 +3517,7 @@ def page_calendario():
 
     for dept in selected_depts:
         st.markdown(
-            f'<div class="section-title">{dept["name"]}</div>',
+            f'<div class="section-title">{esc(dept["name"])}</div>',
             unsafe_allow_html=True
         )
 
@@ -3184,28 +3549,48 @@ def page_calendario():
                     current = date(year, month, day_num)
 
                     busy = False
+                    blocked = False
                     guest_name = ""
+                    block_reason = ""
 
-                    for r in reservations:
-                        if r["department_id"] != dept["id"]:
+                    for b in blocks:
+                        if b["department_id"] != dept["id"]:
                             continue
-
-                        ri = date.fromisoformat(r["check_in"])
-                        ro = date.fromisoformat(r["check_out"])
-
-                        if ri <= current < ro:
-                            busy = True
-                            guest_name = r["guest"]
+                        if b["start_date"] <= current < b["end_date"]:
+                            blocked = True
+                            block_reason = b["reason"]
                             break
 
-                    cls = "calendar-day busy" if busy else "calendar-day"
-                    status_class = "busy" if busy else "free"
-                    status_text = "Ocup." if busy else "Libre"
-                    dot = "🔴" if busy else "🟢"
+                    if not blocked:
+                        for r in reservations:
+                            if r["department_id"] != dept["id"]:
+                                continue
+
+                            ri = date.fromisoformat(str(r["check_in"])[:10])
+                            ro = date.fromisoformat(str(r["check_out"])[:10])
+
+                            if ri <= current < ro:
+                                busy = True
+                                guest_name = r["guest"]
+                                break
+
+                    cls = (
+                        "calendar-day busy" if busy
+                        else "calendar-day blocked" if blocked
+                        else "calendar-day"
+                    )
+                    status_class = "busy" if busy else "blocked" if blocked else "free"
+                    status_text = "Ocup." if busy else "Mant." if blocked else "Libre"
+                    dot = "🔴" if busy else "🛠️" if blocked else "🟢"
+                    title_text = (
+                        guest_name if busy
+                        else block_reason if blocked
+                        else "Disponible"
+                    )
 
                     st.markdown(
                         f"""
-                        <div class="{cls}" title="{html_escape(str(guest_name)) if busy else 'Disponible'}">
+                        <div class="{cls}" title="{esc(title_text)}">
                             <div class="calendar-day-number">{day_num}</div>
                             <div class="calendar-status {status_class}">{dot} {status_text}</div>
                         </div>
@@ -3215,6 +3600,8 @@ def page_calendario():
 
                     if busy:
                         st.caption(guest_name)
+                    elif blocked:
+                        st.caption(f"Mantención: {block_reason}")
 
     st.divider()
 
@@ -3229,14 +3616,14 @@ def page_calendario():
     with b1:
         search_in = st.date_input(
             "Entrada",
-            value=date.today(),
+            value=today_cl(),
             key="search_in"
         )
 
     with b2:
         search_out = st.date_input(
             "Salida",
-            value=date.today() + timedelta(days=2),
+            value=today_cl() + timedelta(days=2),
             key="search_out"
         )
 
@@ -3277,7 +3664,10 @@ def page_calendario():
                 conflict = conflict_exists(
                     d["id"], search_in, search_out
                 )
-                if not conflict:
+                block = block_conflict_exists(
+                    d["id"], search_in, search_out
+                )
+                if not conflict and not block:
                     available.append(d)
 
             if available:
@@ -3291,17 +3681,24 @@ def page_calendario():
 
                 for i, d in enumerate(available):
                     with result_cols[i % 3]:
-                        total_reference = nights_search * int(d["summer_price"])
+                        season_price = season_price_for(
+                            get_seasons(d["id"], d["condo"]),
+                            search_in,
+                            d["id"],
+                            d["condo"],
+                        )
+                        night_price = season_price or int(d["summer_price"])
+                        total_reference = nights_search * night_price
                         st.markdown(
                             f"""
                             <div class="search-result-card">
-                                <div class="search-result-building">🏢 {html_escape(str(d['condo']))}</div>
-                                <div class="search-result-name">{html_escape(str(d['name']))}</div>
+                                <div class="search-result-building">🏢 {esc(d['condo'])}</div>
+                                <div class="search-result-name">{esc(d['name'])}</div>
                                 <div>👥 Hasta {d['capacity']} huéspedes</div>
                                 <div>🌙 {nights_search} noche(s)</div>
-                                <div>☀️ Verano · {money(d['summer_price'])} / noche</div>
+                                <div>🌤️ {money(night_price)} / noche</div>
                                 <div style="margin-top:7px;font-weight:800;color:{FUCHSIA_DARK}">
-                                    Referencia verano: {money(total_reference)}
+                                    Referencia: {money(total_reference)}
                                 </div>
                             </div>
                             """,
@@ -3319,32 +3716,17 @@ def page_calendario():
 # =========================================================
 
 def page_departamentos():
-    if not is_admin():
-        page_section_header("Mis departamentos", "Propiedades vinculadas a tu RUT.")
-        departments = get_departments()
-        if not departments:
-            st.info("Aún no tienes departamentos asociados. Solicita a la administradora que los asigne.")
-            return
-        cols = st.columns(3)
-        for i, d in enumerate(departments):
-            with cols[i % 3]:
-                with st.container(border=True):
-                    st.markdown(f"**{html_escape(d['condo'])} · {html_escape(d['name'])}**")
-                    st.write(f"Capacidad: {d['capacity']} huéspedes")
-                    st.write(f"Invierno: {money(d['winter_price'])}")
-                    st.write(f"Verano: {money(d['summer_price'])}")
-                    st.caption(f"RUT propietario: {d['owner_rut']}")
-        return
     page_section_header(
         "Departamentos",
         "Explora tus edificios y administra los departamentos de cada uno."
     )
 
     departments = get_departments()
-    owners = admin_owners()
-    owner_labels = {f"{o['full_name']} · {o['rut']}": o['id'] for o in owners}
-    if not owners:
-        st.warning("Primero registra un propietario desde la sección Propietarios.")
+    owners = get_owners(active_only=True)
+    owner_labels = {
+        (f"{o['full_name']} · {o['rut']}" if o["rut"] else o["full_name"]): int(o["id"])
+        for o in owners
+    }
 
     with st.expander("＋ Agregar departamento"):
         st.caption(
@@ -3363,10 +3745,13 @@ def page_departamentos():
             key="new_department_name"
         )
 
-        selected_owner_label = st.selectbox(
-            "RUT del dueño / propietario", list(owner_labels),
-            key="new_department_owner", disabled=not bool(owner_labels),
-        ) if owner_labels else None
+        owner_choice = st.selectbox(
+            "Propietario",
+            ["Sin asignar"] + list(owner_labels.keys()),
+            key="new_department_owner",
+            help="Puedes crear propietarios en la sección Propietarios del menú.",
+        )
+        new_owner_id = owner_labels.get(owner_choice) if owner_choice != "Sin asignar" else None
 
         clean_condo = condo.strip()
         existing_condo_names = {str(d["condo"]).strip() for d in departments}
@@ -3414,8 +3799,8 @@ def page_departamentos():
             )
 
         if st.button("Agregar departamento", type="primary", use_container_width=True):
-            if not clean_condo or not name.strip() or not selected_owner_label:
-                st.warning("Completa el edificio, departamento y propietario.")
+            if not clean_condo or not name.strip():
+                st.warning("Completa el edificio/condominio y el departamento.")
             else:
                 # Si el usuario escribió el mismo edificio con diferencias de mayúsculas,
                 # reutilizamos el nombre que ya existe para mantener todo agrupado.
@@ -3433,7 +3818,7 @@ def page_departamentos():
                         capacity,
                         winter,
                         summer,
-                        owner_labels[selected_owner_label]
+                        owner_id=new_owner_id,
                     )
                     st.success("Departamento agregado correctamente.")
                     st.rerun()
@@ -3466,11 +3851,11 @@ def page_departamentos():
                 st.markdown(
                     f"""
                     <div class="building-card">
-                        <img src="{image_uri}" alt="{condo}">
+                        <img src="{image_uri}" alt="{esc(condo)}">
                         <div class="building-overlay"></div>
                         <div class="building-content">
                             <div class="building-kicker">Edificio / condominio</div>
-                            <div class="building-name">{html_escape(str(condo))}</div>
+                            <div class="building-name">{esc(condo)}</div>
                             <div class="building-count">🏠 {len(deps)} departamento(s)</div>
                         </div>
                     </div>
@@ -3483,7 +3868,7 @@ def page_departamentos():
                     <div class="building-card building-fallback">
                         <div class="building-content">
                             <div class="building-kicker">Edificio / condominio</div>
-                            <div class="building-name">{html_escape(str(condo))}</div>
+                            <div class="building-name">{esc(condo)}</div>
                             <div class="building-count">🏠 {len(deps)} departamento(s)</div>
                         </div>
                     </div>
@@ -3538,108 +3923,641 @@ def page_departamentos():
                         st.markdown(
                             f"""
                             <div class="dept-card">
-                                <div class="dept-name">{html_escape(str(d['name']))}</div>
-                                <div class="dept-condo">{html_escape(str(d['condo']))}</div>
-                                <div>RUT dueño: {d['owner_rut'] or 'Sin asignar'}</div>
+                                <div class="dept-name">{esc(d['name'])}</div>
+                                <div class="dept-condo">{esc(d['condo'])}</div>
                                 <div>👥 Hasta {d['capacity']} huéspedes</div>
                                 <div>❄️ Invierno · {money(d['winter_price'])}</div>
                                 <div>☀️ Verano · {money(d['summer_price'])}</div>
+                                <div>👤 {esc(d['owner_display_name'] or 'Sin propietario')}</div>
                             </div>
                             """,
                             unsafe_allow_html=True
                         )
 
                         with st.expander("Modificar"):
-                            current_owner_id = d["owner_id"]
-                            owner_options = ["Sin asignar"] + list(owner_labels)
-                            owner_current_label = next(
-                                (lbl for lbl, oid in owner_labels.items() if oid == current_owner_id),
-                                "Sin asignar",
-                            )
-                            selected_edit_owner = st.selectbox(
-                                "RUT propietario", owner_options,
-                                index=owner_options.index(owner_current_label),
-                                key=f"owner_d_{d['id']}",
-                            )
-                            next_owner_id = owner_labels.get(selected_edit_owner)
                             new_name = st.text_input(
-                                "Nombre",
-                                value=d["name"],
-                                key=f"dn_{d['id']}"
+                                "Nombre", value=d["name"], key=f"dn_{d['id']}"
                             )
                             new_capacity = st.number_input(
-                                "Capacidad",
-                                min_value=1,
-                                value=int(d["capacity"]),
-                                key=f"dc_{d['id']}"
+                                "Capacidad", min_value=1,
+                                value=int(d["capacity"]), key=f"dc_{d['id']}"
                             )
                             new_winter = st.number_input(
-                                "Invierno",
-                                min_value=0,
-                                value=int(d["winter_price"]),
-                                step=5000,
+                                "Invierno", min_value=0,
+                                value=int(d["winter_price"]), step=5000,
                                 key=f"dw_{d['id']}"
                             )
                             new_summer = st.number_input(
-                                "Verano",
-                                min_value=0,
-                                value=int(d["summer_price"]),
-                                step=5000,
+                                "Verano", min_value=0,
+                                value=int(d["summer_price"]), step=5000,
                                 key=f"ds_{d['id']}"
                             )
+                            owner_options = ["Sin asignar"] + list(owner_labels.keys())
+                            current_owner_label = next(
+                                (label for label, oid in owner_labels.items()
+                                 if oid == d["owner_id"]),
+                                "Sin asignar",
+                            )
+                            edit_owner = st.selectbox(
+                                "Propietario", owner_options,
+                                index=owner_options.index(current_owner_label),
+                                key=f"downer_{d['id']}",
+                            )
+                            edit_owner_id = (
+                                owner_labels.get(edit_owner)
+                                if edit_owner != "Sin asignar" else None
+                            )
+                            new_address = st.text_input(
+                                "Dirección", value=d["address"] or "",
+                                key=f"daddr_{d['id']}"
+                            )
+                            new_wifi_name = st.text_input(
+                                "WiFi (red)", value=d["wifi_name"] or "",
+                                key=f"dwifi_{d['id']}"
+                            )
+                            new_wifi_pass = st.text_input(
+                                "WiFi (clave)", value=d["wifi_password"] or "",
+                                key=f"dpass_{d['id']}", type="password"
+                            )
+                            new_notes = st.text_area(
+                                "Notas internas", value=d["notes"] or "",
+                                key=f"dnotes_{d['id']}"
+                            )
 
-                            if st.button("Guardar cambios", key=f"save_d_{d['id']}", use_container_width=True):
-                                conn = db()
-                                cols_db = department_columns()
-                                if "condominium" in cols_db:
-                                    conn.execute("""
-                                        UPDATE departments
-                                        SET name=?, capacity=?, winter_price=?, summer_price=?, owner_id=?, condominium=condo
-                                        WHERE id=?
-                                    """, (new_name, new_capacity, new_winter, new_summer, next_owner_id, d["id"]))
+                            if st.button(
+                                "Guardar cambios", key=f"save_d_{d['id']}",
+                                use_container_width=True,
+                            ):
+                                try:
+                                    update_department(
+                                        d["id"], name=new_name.strip(),
+                                        capacity=int(new_capacity),
+                                        winter_price=int(new_winter),
+                                        summer_price=int(new_summer),
+                                        owner_id=edit_owner_id,
+                                        address=new_address.strip(),
+                                        wifi_name=new_wifi_name.strip(),
+                                        wifi_password=new_wifi_pass.strip(),
+                                        notes=new_notes.strip(),
+                                    )
+                                except Exception as exc:
+                                    st.error(f"No se pudo actualizar: {exc}")
                                 else:
-                                    conn.execute("""
-                                        UPDATE departments
-                                        SET name=?, capacity=?, winter_price=?, summer_price=?, owner_id=?
-                                        WHERE id=?
-                                    """, (new_name, new_capacity, new_winter, new_summer, next_owner_id, d["id"]))
-                                conn.commit()
-                                conn.close()
-                                st.success("Departamento actualizado.")
-                                st.rerun()
+                                    st.success("Departamento actualizado.")
+                                    st.rerun()
 
                             st.markdown('<div class="danger-zone"></div>', unsafe_allow_html=True)
 
                             if st.button(
-                                "🗑️ Eliminar departamento",
-                                key=f"delete_d_{d['id']}",
-                                use_container_width=True
+                                "Archivar departamento",
+                                key=f"archive_d_{d['id']}",
+                                use_container_width=True,
+                                help="Lo oculta de las listas sin borrar su historial.",
                             ):
-                                conn = db()
-                                reservation_count = conn.execute(
-                                    "SELECT COUNT(*) FROM reservations WHERE department_id=?",
-                                    (d["id"],)
-                                ).fetchone()[0]
-
-                                if reservation_count:
-                                    conn.close()
-                                    st.error(
-                                        "No se puede eliminar este departamento porque "
-                                        f"tiene {reservation_count} reserva(s) asociada(s). "
-                                        "Elimina o gestiona primero esas reservas."
-                                    )
+                                try:
+                                    archive_department(d["id"])
+                                except Exception as exc:
+                                    st.error(f"No se pudo archivar: {exc}")
                                 else:
-                                    old_condo = d["condo"]
-                                    conn.execute(
-                                        "DELETE FROM departments WHERE id=?",
-                                        (d["id"],)
-                                    )
-                                    conn.commit()
-                                    conn.close()
-                                    delete_condo_image_if_unused(old_condo)
-                                    st.success("Departamento eliminado correctamente.")
+                                    st.success("Departamento archivado.")
                                     st.rerun()
 
+                            if st.button(
+                                "🗑️ Eliminar definitivamente",
+                                key=f"delete_d_{d['id']}",
+                                use_container_width=True,
+                            ):
+                                st.session_state[f"confirm_del_dept_{d['id']}"] = True
+                                st.rerun()
+
+                            if st.session_state.get(f"confirm_del_dept_{d['id']}", False):
+                                st.warning(
+                                    "Solo se puede eliminar si no tiene reservas ni "
+                                    "liquidaciones. Esta acción no se puede deshacer."
+                                )
+                                dc1, dc2 = st.columns(2)
+                                with dc1:
+                                    if st.button(
+                                        "Sí, eliminar",
+                                        key=f"confirm_del_dept_yes_{d['id']}",
+                                        type="primary",
+                                        use_container_width=True,
+                                    ):
+                                        try:
+                                            old_condo = delete_department_safe(d["id"])
+                                        except ValueError as exc:
+                                            st.error(str(exc))
+                                        except Exception as exc:
+                                            st.error(f"No se pudo eliminar: {exc}")
+                                        else:
+                                            st.session_state.pop(
+                                                f"confirm_del_dept_{d['id']}", None
+                                            )
+                                            delete_condo_image_if_unused(old_condo)
+                                            st.success("Departamento eliminado.")
+                                            st.rerun()
+                                with dc2:
+                                    if st.button(
+                                        "Cancelar",
+                                        key=f"confirm_del_dept_no_{d['id']}",
+                                        use_container_width=True,
+                                    ):
+                                        st.session_state.pop(
+                                            f"confirm_del_dept_{d['id']}", None
+                                        )
+                                        st.rerun()
+
+                        with st.expander("Temporadas y precios"):
+                            seasons = [
+                                season for season in get_seasons(d["id"], d["condo"])
+                                if season["department_id"] == d["id"]
+                            ]
+                            if seasons:
+                                for season in seasons:
+                                    sc1, sc2 = st.columns([4, 1])
+                                    with sc1:
+                                        st.markdown(
+                                            f"**{esc(season['name'])}** · "
+                                            f"{season['start_date']:%d/%m/%Y} → "
+                                            f"{season['end_date']:%d/%m/%Y} · "
+                                            f"{money(season['price_per_night'])}/noche"
+                                        )
+                                    with sc2:
+                                        if st.button(
+                                            "Quitar",
+                                            key=f"del_season_{season['id']}",
+                                            use_container_width=True,
+                                        ):
+                                            try:
+                                                delete_season(season["id"])
+                                            except Exception as exc:
+                                                st.error(str(exc))
+                                            else:
+                                                st.rerun()
+                            else:
+                                st.caption("Sin temporadas propias. Se usan los precios de invierno/verano.")
+
+                            with st.form(key=f"season_form_{d['id']}"):
+                                season_name = st.text_input(
+                                    "Nombre de la temporada",
+                                    value="Temporada alta",
+                                )
+                                sd1, sd2 = st.columns(2)
+                                with sd1:
+                                    season_start = st.date_input(
+                                        "Desde", value=today_cl()
+                                    )
+                                with sd2:
+                                    season_end = st.date_input(
+                                        "Hasta", value=today_cl() + timedelta(days=30)
+                                    )
+                                season_price = st.number_input(
+                                    "Precio por noche", min_value=0,
+                                    value=int(d["summer_price"]), step=5000,
+                                )
+                                season_priority = st.number_input(
+                                    "Prioridad", min_value=0, value=10, step=1,
+                                    help="Si dos temporadas se cruzan, gana la de mayor prioridad."
+                                )
+                                if st.form_submit_button(
+                                    "Agregar temporada", use_container_width=True
+                                ):
+                                    if season_end <= season_start:
+                                        st.error("La fecha final debe ser posterior a la inicial.")
+                                    else:
+                                        try:
+                                            add_season(
+                                                season_name, season_start, season_end,
+                                                season_price, department_id=d["id"],
+                                                priority=season_priority,
+                                            )
+                                        except Exception as exc:
+                                            st.error(f"No se pudo guardar la temporada: {exc}")
+                                        else:
+                                            st.success("Temporada agregada.")
+                                            st.rerun()
+
+                        with st.expander("Bloqueos por mantención"):
+                            dept_blocks = get_blocks(d["id"])
+                            if dept_blocks:
+                                for block in dept_blocks:
+                                    bc1, bc2 = st.columns([4, 1])
+                                    with bc1:
+                                        st.markdown(
+                                            f"**{esc(block['reason'])}** · "
+                                            f"{block['start_date']:%d/%m/%Y} → "
+                                            f"{block['end_date']:%d/%m/%Y}"
+                                        )
+                                    with bc2:
+                                        if st.button(
+                                            "Quitar",
+                                            key=f"del_block_{block['id']}",
+                                            use_container_width=True,
+                                        ):
+                                            try:
+                                                delete_block(block["id"])
+                                            except Exception as exc:
+                                                st.error(str(exc))
+                                            else:
+                                                st.rerun()
+                            else:
+                                st.caption("Sin bloqueos. Las fechas están disponibles para reservar.")
+
+                            with st.form(key=f"block_form_{d['id']}"):
+                                block_reason = st.text_input(
+                                    "Motivo", value="Mantención"
+                                )
+                                bd1, bd2 = st.columns(2)
+                                with bd1:
+                                    block_start = st.date_input(
+                                        "Desde", value=today_cl()
+                                    )
+                                with bd2:
+                                    block_end = st.date_input(
+                                        "Hasta", value=today_cl() + timedelta(days=7)
+                                    )
+                                if st.form_submit_button(
+                                    "Agregar bloqueo", use_container_width=True
+                                ):
+                                    if block_end <= block_start:
+                                        st.error("La fecha final debe ser posterior a la inicial.")
+                                    else:
+                                        try:
+                                            add_block(
+                                                d["id"], block_start, block_end,
+                                                block_reason,
+                                            )
+                                        except Exception as exc:
+                                            st.error(
+                                                "No se pudo bloquear: "
+                                                f"{exc}"
+                                            )
+                                        else:
+                                            st.success("Bloqueo agregado.")
+                                            st.rerun()
+
+
+# =========================================================
+# PROPIETARIOS
+# =========================================================
+
+def page_propietarios():
+    page_section_header(
+        "Propietarios",
+        "Datos de contacto, banco y comisión de cada propietario.",
+    )
+
+    owners = get_owners()
+    departments = get_departments(include_inactive=True)
+
+    with st.expander("＋ Nuevo propietario", expanded=not owners):
+        with st.form("new_owner_form", clear_on_submit=True):
+            c1, c2 = st.columns(2)
+            with c1:
+                full_name = st.text_input("Nombre completo")
+                rut = st.text_input("RUT")
+                phone = st.text_input("Teléfono")
+                email = st.text_input("Email")
+            with c2:
+                bank_name = st.text_input("Banco")
+                bank_account = st.text_input("Cuenta")
+                bank_holder = st.text_input("Titular de la cuenta")
+                commission = st.number_input(
+                    "Comisión (%)", min_value=0, max_value=100,
+                    value=10, step=1,
+                )
+            notes = st.text_area("Notas")
+            if st.form_submit_button(
+                "Guardar propietario", type="primary",
+                use_container_width=True,
+            ):
+                if not full_name.strip():
+                    st.error("Ingresa el nombre del propietario.")
+                else:
+                    try:
+                        save_owner(
+                            full_name, rut, phone, email, bank_name,
+                            bank_account, bank_holder, commission, notes,
+                        )
+                    except Exception as exc:
+                        st.error(f"No se pudo guardar: {exc}")
+                    else:
+                        st.success("Propietario guardado.")
+                        st.rerun()
+
+    if not owners:
+        st.info("Aún no hay propietarios registrados.")
+        return
+
+    for owner in owners:
+        owned = [d for d in departments if d["owner_id"] == owner["id"]]
+        active_label = "Activo" if owner["active"] else "Inactivo"
+        st.markdown(
+            f"""
+            <div class="owner-card">
+                <div style="display:flex;justify-content:space-between;gap:10px;flex-wrap:wrap">
+                    <div>
+                        <div style="font-size:1.08rem;font-weight:800">{esc(owner['full_name'])}</div>
+                        <div style="color:{MUTED};font-size:.86rem">
+                            {esc(owner['rut'] or 'Sin RUT')} · {esc(owner['phone'] or 'Sin teléfono')} · {esc(owner['email'] or 'Sin email')}
+                        </div>
+                    </div>
+                    <span class="status-pill {'ok' if owner['active'] else 'danger'}">{active_label}</span>
+                </div>
+                <div style="margin-top:8px;color:{MUTED};font-size:.88rem">
+                    Comisión: <b>{owner['commission_percent']}%</b> ·
+                    {len(owned)} departamento(s) asignado(s)
+                </div>
+            </div>
+            """,
+            unsafe_allow_html=True,
+        )
+
+        with st.expander(f"Editar datos de {owner['full_name']}"):
+            with st.form(f"owner_form_{owner['id']}"):
+                c1, c2 = st.columns(2)
+                with c1:
+                    e_full = st.text_input(
+                        "Nombre completo", value=owner["full_name"]
+                    )
+                    e_rut = st.text_input("RUT", value=owner["rut"] or "")
+                    e_phone = st.text_input("Teléfono", value=owner["phone"] or "")
+                    e_email = st.text_input("Email", value=owner["email"] or "")
+                with c2:
+                    e_bank = st.text_input("Banco", value=owner["bank_name"] or "")
+                    e_account = st.text_input(
+                        "Cuenta", value=owner["bank_account"] or ""
+                    )
+                    e_holder = st.text_input(
+                        "Titular", value=owner["bank_holder"] or ""
+                    )
+                    e_commission = st.number_input(
+                        "Comisión (%)", min_value=0, max_value=100,
+                        value=int(owner["commission_percent"]), step=1,
+                    )
+                e_notes = st.text_area("Notas", value=owner["notes"] or "")
+                e_active = st.checkbox("Activo", value=bool(owner["active"]))
+                if st.form_submit_button(
+                    "Guardar cambios", type="primary",
+                    use_container_width=True,
+                ):
+                    try:
+                        save_owner(
+                            e_full, e_rut, e_phone, e_email, e_bank,
+                            e_account, e_holder, e_commission, e_notes,
+                            e_active, owner_id=owner["id"],
+                        )
+                    except Exception as exc:
+                        st.error(f"No se pudo actualizar: {exc}")
+                    else:
+                        st.success("Propietario actualizado.")
+                        st.rerun()
+
+
+# =========================================================
+# REPORTES
+# =========================================================
+
+def _report_table(rows, numeric_columns=()):
+    """Muestra una tabla compacta con la identidad rosada de la app."""
+    if not rows:
+        st.info("Sin datos para el período.")
+        return
+
+    columns = list(rows[0].keys())
+    numeric = {str(column) for column in numeric_columns}
+
+    head = "".join(f"<th>{esc(column)}</th>" for column in columns)
+    body = []
+    for row in rows:
+        cells = []
+        for column in columns:
+            align = "right" if column in numeric else "left"
+            cells.append(
+                f'<td style="text-align:{align}">{esc(row.get(column, ""))}</td>'
+            )
+        body.append(f"<tr>{''.join(cells)}</tr>")
+
+    st.markdown(
+        f"""
+        <div class="report-table-wrap">
+            <table class="report-table">
+                <thead><tr>{head}</tr></thead>
+                <tbody>{''.join(body)}</tbody>
+            </table>
+        </div>
+        """,
+        unsafe_allow_html=True,
+    )
+
+
+def page_reportes():
+    page_section_header(
+        "Reportes",
+        "Ingresos, cobros, ocupación y liquidación estimada por período.",
+    )
+
+    reservations_all = get_reservations(include_cancelled=True)
+    departments = get_departments(include_inactive=True)
+    owners = get_owners()
+
+    r1, r2 = st.columns(2)
+    with r1:
+        year = st.number_input(
+            "Año", min_value=2024, max_value=2035,
+            value=today_cl().year, step=1, key="report_year",
+        )
+    with r2:
+        month = st.selectbox(
+            "Mes", list(range(1, 13)),
+            index=today_cl().month - 1,
+            format_func=lambda m: _MESES[m - 1].capitalize(),
+            key="report_month",
+        )
+
+    month_start = date(int(year), int(month), 1)
+    month_end = date(
+        int(year), int(month), monthrange(int(year), int(month))[1]
+    )
+
+    month_res = [
+        r for r in reservations_all
+        if r["status"] != STATUS_CANCELLED
+        and month_start <= date.fromisoformat(str(r["check_in"])[:10]) <= month_end
+    ]
+
+    total_income = sum(int(r["total"]) for r in month_res)
+    total_paid = sum(int(r["paid"]) for r in month_res)
+    total_pending = max(total_income - total_paid, 0)
+    total_nights = sum(int(r["nights"]) for r in month_res)
+    active_depts = [d for d in departments if d["active"]]
+    available_nights = max(len(active_depts) * (month_end - month_start).days + len(active_depts), 1)
+    occupancy = min(total_nights / available_nights * 100, 100)
+
+    m1, m2, m3, m4 = st.columns(4)
+    metrics = [
+        ("INGRESOS RESERVADOS", money(total_income)),
+        ("COBRADO", money(total_paid)),
+        ("SALDO PENDIENTE", money(total_pending)),
+        ("OCUPACIÓN", f"{occupancy:.0f}%"),
+    ]
+    for column, (label, value) in zip((m1, m2, m3, m4), metrics):
+        with column:
+            st.markdown(
+                f'<div class="metric-card"><div class="metric-label">{label}</div>'
+                f'<div class="metric-value">{value}</div></div>',
+                unsafe_allow_html=True,
+            )
+
+    st.caption(
+        f"{len(month_res)} reserva(s) · {total_nights} noche(s) vendidas en "
+        f"{len(active_depts)} departamento(s) activo(s)."
+    )
+
+    if not month_res:
+        st.info("No hay reservas cuyo check-in caiga en el período seleccionado.")
+        return
+
+    st.markdown('<div class="section-title">Por edificio</div>', unsafe_allow_html=True)
+    by_condo = defaultdict(lambda: {"reservas": 0, "ingresos": 0, "cobrado": 0, "saldo": 0, "noches": 0})
+    for r in month_res:
+        row = by_condo[r["condo"]]
+        row["reservas"] += 1
+        row["ingresos"] += int(r["total"])
+        row["cobrado"] += int(r["paid"])
+        row["saldo"] += max(int(r["total"]) - int(r["paid"]), 0)
+        row["noches"] += int(r["nights"])
+
+    chart_rows = []
+    for condo, data in sorted(by_condo.items()):
+        chart_rows.append({
+            "Edificio": condo, "Tipo": "Ingresos",
+            "Monto": int(data["ingresos"]),
+        })
+        chart_rows.append({
+            "Edificio": condo, "Tipo": "Cobrado",
+            "Monto": int(data["cobrado"]),
+        })
+
+    chart = (
+        alt.Chart(pd.DataFrame(chart_rows))
+        .mark_bar(cornerRadiusEnd=5)
+        .encode(
+            x=alt.X(
+                "Monto:Q",
+                title=None,
+                axis=alt.Axis(
+                    format=",.0f", gridColor=PINK_LIGHT, labelColor=MUTED,
+                    domainColor=PINK_BORDER, tickColor=PINK_BORDER,
+                ),
+            ),
+            y=alt.Y(
+                "Edificio:N",
+                title=None,
+                sort=alt.EncodingSortField(
+                    field="Monto", op="sum", order="descending"
+                ),
+                axis=alt.Axis(
+                    labelColor=TEXT, domainColor=PINK_BORDER,
+                    tickColor=PINK_BORDER,
+                ),
+            ),
+            xOffset=alt.XOffset("Tipo:N", sort=["Ingresos", "Cobrado"]),
+            color=alt.Color(
+                "Tipo:N",
+                scale=alt.Scale(
+                    domain=["Ingresos", "Cobrado"],
+                    range=[FUCHSIA, "#F4A6CD"],
+                ),
+                legend=alt.Legend(orient="top", title=None, labelColor=TEXT),
+            ),
+            tooltip=[
+                alt.Tooltip("Edificio:N"),
+                alt.Tooltip("Tipo:N"),
+                alt.Tooltip("Monto:Q", format=",.0f", title="Monto (CLP)"),
+            ],
+        )
+        .properties(height=max(120, 44 * len(by_condo)))
+    )
+    st.altair_chart(chart, use_container_width=True)
+    st.caption(
+        "Rosado fuerte: ingresos reservados. Rosado suave: dinero ya cobrado."
+    )
+
+    _report_table(
+        [
+            {
+                "Edificio": condo,
+                "Reservas": data["reservas"],
+                "Noches": data["noches"],
+                "Ingresos": money(data["ingresos"]),
+                "Cobrado": money(data["cobrado"]),
+                "Saldo": money(data["saldo"]),
+            }
+            for condo, data in sorted(by_condo.items())
+        ],
+        numeric_columns=("Reservas", "Noches", "Ingresos", "Cobrado", "Saldo"),
+    )
+
+    st.markdown('<div class="section-title">Por propietario</div>', unsafe_allow_html=True)
+    owner_commission = {int(o["id"]): int(o["commission_percent"]) for o in owners}
+    by_owner = defaultdict(lambda: {"reservas": 0, "ingresos": 0, "comision": 0, "neto": 0})
+    for r in month_res:
+        key = r["owner_display_name"] or "Sin asignar"
+        row = by_owner[key]
+        row["reservas"] += 1
+        row["ingresos"] += int(r["total"])
+        pct = owner_commission.get(int(r["owner_id"]), 0) if r["owner_id"] else 0
+        commission = (int(r["total"]) * pct + 50) // 100
+        row["comision"] += commission
+        row["neto"] += int(r["total"]) - commission
+    _report_table(
+        [
+            {
+                "Propietario": name,
+                "Reservas": data["reservas"],
+                "Ingresos": money(data["ingresos"]),
+                "Comisión estimada": money(data["comision"]),
+                "Neto estimado": money(data["neto"]),
+            }
+            for name, data in sorted(by_owner.items())
+        ],
+        numeric_columns=(
+            "Reservas", "Ingresos", "Comisión estimada", "Neto estimado",
+        ),
+    )
+    st.caption(
+        "La comisión estimada usa el porcentaje del propietario. "
+        "Los gastos reales se descuentan al preparar cada liquidación."
+    )
+
+    export_rows = []
+    for r in month_res:
+        export_rows.append({
+            "Reserva": r["id"],
+            "Edificio": r["condo"],
+            "Departamento": r["dept_name"],
+            "Huésped": r["guest"],
+            "Check-in": r["check_in"],
+            "Check-out": r["check_out"],
+            "Noches": r["nights"],
+            "Total": r["total"],
+            "Pagado": r["paid"],
+            "Saldo": max(int(r["total"]) - int(r["paid"]), 0),
+            "Estado": r["status"],
+            "Propietario": r["owner_display_name"] or "",
+        })
+    buffer = StringIO()
+    writer = csv.DictWriter(buffer, fieldnames=list(export_rows[0].keys()))
+    writer.writeheader()
+    writer.writerows(export_rows)
+    st.download_button(
+        "Descargar reporte CSV",
+        data=buffer.getvalue().encode("utf-8-sig"),
+        file_name=f"reporte_{int(year)}_{int(month):02d}.csv",
+        mime="text/csv",
+        use_container_width=True,
+    )
 
 
 # =========================================================
@@ -3651,33 +4569,6 @@ EXPENSE_PRESETS = (
     ("sabanas", "Lavado de sábanas"),
     ("ventanas", "Limpieza de ventanas"),
 )
-
-
-def format_clp(value):
-    """Moneda CLP correcta para montos negativos, sin decimales."""
-    value = int(value)
-    return ("-" if value < 0 else "") + money(abs(value))
-
-
-def calculate_owner_liquidation(gross_total, commission_percent, expenses):
-    """La comisión corresponde al bruto reservado, nunca al abono recibido."""
-    gross_total = int(gross_total)
-    commission_percent = int(commission_percent)
-    if gross_total < 0 or commission_percent not in (10, 12):
-        raise ValueError("Monto o porcentaje de comisión no permitido.")
-    commission = (gross_total * commission_percent + 50) // 100
-    expenses_total = 0
-    for item in expenses:
-        amount = int(item["amount"])
-        if amount < 0:
-            raise ValueError("Los gastos no pueden ser negativos.")
-        expenses_total += amount
-    return {
-        "gross_total": gross_total,
-        "commission_amount": commission,
-        "expenses_total": expenses_total,
-        "owner_net": gross_total - commission - expenses_total,
-    }
 
 
 def get_owner_liquidation_settings(department_id):
@@ -3842,7 +4733,7 @@ def owner_liquidation_pdf(statement):
     if dated and hasattr(dated, "strftime"):
         issued = dated.strftime("%d/%m/%Y")
     else:
-        issued = pdf_date(dated or date.today().isoformat())
+        issued = pdf_date(dated or today_cl().isoformat())
 
     story = [
         Paragraph("LIQUIDACIÓN DE ARRIENDO", title_style),
@@ -3955,6 +4846,258 @@ def filter_owner_liquidations(statements, condo="Todos", department="Todos", sea
     return sorted(result, key=lambda x: (str(x["check_in"]), int(x["id"])), reverse=True)
 
 
+def save_owner_statement(owner_id, period_start, period_end, items, notes=""):
+    """Guarda un estado de cuenta mensual con el detalle de sus liquidaciones."""
+    gross = sum(int(item["gross_total"]) for item in items)
+    commission = sum(int(item["commission_amount"]) for item in items)
+    expenses = sum(int(item["expenses_total"]) for item in items)
+    net = sum(int(item["net_total"]) for item in items)
+    conn = db()
+    try:
+        cur = conn.cursor()
+        statement_id = cur.execute("""
+            INSERT INTO owner_statements
+                (owner_id, period_start, period_end, gross_total,
+                 commission_total, expenses_total, net_total, notes)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+            RETURNING id
+        """, (
+            int(owner_id), period_start, period_end, gross,
+            commission, expenses, net, notes.strip(),
+        )).fetchone()["id"]
+        for item in items:
+            cur.execute("""
+                INSERT INTO owner_statement_items
+                    (statement_id, reservation_id, owner_liquidation_id,
+                     condo_name, department_name, guest_name, check_in, check_out,
+                     nights, price_night, gross_total, commission_percent,
+                     commission_amount, expenses_total, net_total, detail)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?::jsonb)
+            """, (
+                int(statement_id), int(item["reservation_id"]),
+                item.get("owner_liquidation_id"),
+                item["condo_name"], item["department_name"], item["guest_name"],
+                item["check_in"], item["check_out"], int(item["nights"]),
+                int(item["price_night"]), int(item["gross_total"]),
+                int(item["commission_percent"]), int(item["commission_amount"]),
+                int(item["expenses_total"]), int(item["net_total"]),
+                json.dumps(item.get("detail") or {}, ensure_ascii=False),
+            ))
+        conn.commit()
+        return int(statement_id)
+    except Exception:
+        conn.rollback()
+        raise
+    finally:
+        conn.close()
+
+
+def list_owner_statements(owner_id=None):
+    conn = db()
+    try:
+        where = "WHERE s.owner_id=?" if owner_id is not None else ""
+        params = (int(owner_id),) if owner_id is not None else ()
+        return conn.execute(f"""
+            SELECT s.*, o.full_name AS owner_name
+            FROM owner_statements s
+            JOIN owners o ON o.id=s.owner_id
+            {where}
+            ORDER BY s.period_start DESC, s.id DESC
+        """, params).fetchall()
+    finally:
+        conn.close()
+
+
+def mark_owner_statement_paid(statement_id, reference=""):
+    conn = db()
+    try:
+        conn.execute("""
+            UPDATE owner_statements
+            SET status='Pagada', paid_at=NOW(), payment_reference=?
+            WHERE id=?
+        """, (reference.strip(), int(statement_id)))
+        conn.commit()
+    except Exception:
+        conn.rollback()
+        raise
+    finally:
+        conn.close()
+
+
+def page_resumen_mensual():
+    st.markdown('<div class="section-title">Resumen mensual por propietario</div>', unsafe_allow_html=True)
+    st.caption(
+        "Agrupa las liquidaciones de un mes, guarda el estado de cuenta y "
+        "marca cuándo fue pagado al propietario."
+    )
+    owners = get_owners()
+    if not owners:
+        st.info("Primero registra propietarios en la sección Propietarios.")
+        return
+
+    owner_map = {
+        (f"{o['full_name']} · {o['rut']}" if o["rut"] else o["full_name"]): o
+        for o in owners
+    }
+    c1, c2, c3 = st.columns([2, 1, 1])
+    with c1:
+        owner_label = st.selectbox(
+            "Propietario", list(owner_map.keys()), key="stmt_owner"
+        )
+    with c2:
+        year = st.number_input(
+            "Año", min_value=2024, max_value=2035,
+            value=today_cl().year, step=1, key="stmt_year",
+        )
+    with c3:
+        month = st.selectbox(
+            "Mes", list(range(1, 13)),
+            index=today_cl().month - 1,
+            format_func=lambda m: _MESES[m - 1].capitalize(),
+            key="stmt_month",
+        )
+    owner = owner_map[owner_label]
+    period_start = date(int(year), int(month), 1)
+    period_end = date(int(year), int(month), monthrange(int(year), int(month))[1])
+
+    reservations = get_reservations(include_cancelled=True)
+    reservation_map = {int(r["id"]): r for r in reservations}
+    liquidations = list_owner_liquidations()
+    items = []
+    for liquidation in liquidations:
+        reservation = reservation_map.get(int(liquidation["reservation_id"]))
+        if not reservation:
+            continue
+        check_in = date.fromisoformat(str(liquidation["check_in"])[:10])
+        if not (period_start <= check_in <= period_end):
+            continue
+        belongs = int(reservation["owner_id"] or 0) == int(owner["id"])
+        same_name = (
+            str(liquidation["owner_name"]).strip().casefold()
+            == str(owner["full_name"]).strip().casefold()
+        )
+        if not belongs and not same_name:
+            continue
+        items.append({
+            "reservation_id": int(liquidation["reservation_id"]),
+            "owner_liquidation_id": int(liquidation["id"]),
+            "condo_name": liquidation["condo_name"],
+            "department_name": liquidation["department_name"],
+            "guest_name": liquidation["guest_name"],
+            "check_in": check_in,
+            "check_out": date.fromisoformat(str(liquidation["check_out"])[:10]),
+            "nights": int(liquidation["nights"]),
+            "price_night": int(liquidation["price_night"]),
+            "gross_total": int(liquidation["gross_total"]),
+            "commission_percent": int(liquidation["commission_percent"]),
+            "commission_amount": int(liquidation["commission_amount"]),
+            "expenses_total": int(liquidation["expenses_total"]),
+            "net_total": int(liquidation["owner_net"]),
+            "detail": liquidation.get("expenses") or [],
+        })
+
+    if not items:
+        st.info("No hay liquidaciones guardadas para ese propietario y período.")
+    else:
+        st.dataframe(
+            [
+                {
+                    "Reserva": item["reservation_id"],
+                    "Departamento": item["department_name"],
+                    "Huésped": item["guest_name"],
+                    "Llegada": item["check_in"].strftime("%d/%m/%Y"),
+                    "Bruto": money(item["gross_total"]),
+                    "Comisión": money(item["commission_amount"]),
+                    "Gastos": money(item["expenses_total"]),
+                    "Neto": money(item["net_total"]),
+                }
+                for item in items
+            ],
+            use_container_width=True, hide_index=True,
+        )
+        totals = {
+            "bruto": sum(i["gross_total"] for i in items),
+            "comision": sum(i["commission_amount"] for i in items),
+            "gastos": sum(i["expenses_total"] for i in items),
+            "neto": sum(i["net_total"] for i in items),
+        }
+        st.markdown(
+            f"""
+            <div class="payment-summary">
+                <div class="payment-card"><div class="payment-card-label">BRUTO</div>
+                    <div class="payment-card-value">{money(totals['bruto'])}</div></div>
+                <div class="payment-card"><div class="payment-card-label">COMISIÓN</div>
+                    <div class="payment-card-value">{money(totals['comision'])}</div></div>
+                <div class="payment-card"><div class="payment-card-label">GASTOS</div>
+                    <div class="payment-card-value">{money(totals['gastos'])}</div></div>
+                <div class="payment-card"><div class="payment-card-label">NETO PROPIETARIO</div>
+                    <div class="payment-card-value">{money(totals['neto'])}</div></div>
+            </div>
+            """,
+            unsafe_allow_html=True,
+        )
+        statement_notes = st.text_input(
+            "Observaciones del estado de cuenta", key="stmt_notes"
+        )
+        if st.button(
+            "Guardar estado de cuenta del mes",
+            type="primary", use_container_width=True,
+            key="stmt_save",
+        ):
+            try:
+                statement_id = save_owner_statement(
+                    owner["id"], period_start, period_end, items,
+                    statement_notes,
+                )
+            except Exception as exc:
+                st.error(f"No se pudo guardar el estado de cuenta: {exc}")
+            else:
+                st.success(f"Estado de cuenta guardado (N.º {statement_id}).")
+                st.rerun()
+
+    st.divider()
+    st.markdown('<div class="section-title">Estados de cuenta guardados</div>', unsafe_allow_html=True)
+    statements = list_owner_statements(owner["id"])
+    if not statements:
+        st.caption("Todavía no hay estados de cuenta guardados para este propietario.")
+    for statement in statements:
+        sc1, sc2, sc3 = st.columns([3, 2, 1])
+        with sc1:
+            st.markdown(
+                f"**{statement['period_start']:%d/%m/%Y} → "
+                f"{statement['period_end']:%d/%m/%Y}** · "
+                f"{money(statement['net_total'])} neto"
+            )
+        with sc2:
+            st.caption(
+                f"Bruto {money(statement['gross_total'])} · "
+                f"Comisión {money(statement['commission_total'])} · "
+                f"Gastos {money(statement['expenses_total'])} · "
+                f"Estado: {statement['status']}"
+            )
+        with sc3:
+            if statement["status"] != "Pagada":
+                if st.button(
+                    "Marcar pagada",
+                    key=f"stmt_paid_{statement['id']}",
+                    use_container_width=True,
+                ):
+                    try:
+                        mark_owner_statement_paid(
+                            statement["id"],
+                            f"Pago {today_cl():%d/%m/%Y}",
+                        )
+                    except Exception as exc:
+                        st.error(str(exc))
+                    else:
+                        st.rerun()
+            else:
+                st.caption(
+                    f"Pagada {statement['paid_at']:%d/%m/%Y}"
+                    if statement["paid_at"] else "Pagada"
+                )
+
+
 def page_historial_liquidaciones():
     st.markdown('<div class="section-title">Liquidaciones guardadas</div>', unsafe_allow_html=True)
     statements = list_owner_liquidations()
@@ -4028,7 +5171,7 @@ def page_historial_liquidaciones():
                             use_container_width=True
                         )
                 with action_edit:
-                    if is_admin() and st.button("Editar", key=f"liq_edit_card_{sid}", use_container_width=True):
+                    if st.button("Editar", key=f"liq_edit_card_{sid}", use_container_width=True):
                         st.session_state.liquidation_selected_reservation = int(document["reservation_id"])
                         st.session_state.liq_condo_filter = "Todos"
                         st.session_state.liq_department_filter = "Todos"
@@ -4089,7 +5232,7 @@ def page_preparar_liquidacion():
         version = st.session_state.get(f"liq_refresh_{rid}", 0)
         prefix = f"owner_{rid}_v{version}"
 
-        st.markdown(f"**{r['condo']} · {r['dept_name']}**  |  {r['guest']}")
+        st.markdown(f"**{esc(r['condo'])} · {esc(r['dept_name'])}**  |  {esc(r['guest'])}")
         st.caption(
             f"Entrada: {date.fromisoformat(r['check_in']):%d/%m/%Y} · "
             f"Salida: {date.fromisoformat(r['check_out']):%d/%m/%Y} · "
@@ -4146,8 +5289,9 @@ def page_preparar_liquidacion():
                     step=1000, key=f"{prefix}_{code}_amount",
                     label_visibility="collapsed",
                 )
-            # Los importes usados quedan como referencia para el próximo arriendo.
-            if int(amount) > 0:
+            # Solo recordamos como habitual el gasto que realmente se usó.
+            # Si se desmarca, no debe reactivarse solo en la próxima liquidación.
+            if enabled and int(amount) > 0:
                 usual_costs[code] = int(amount)
             if enabled and amount > 0:
                 expenses.append({"code": code, "concept": concept, "amount": int(amount)})
@@ -4259,10 +5403,6 @@ def page_preparar_liquidacion():
 
 
 def page_liquidaciones():
-    if not is_admin():
-        page_section_header("Mis liquidaciones", "Comprobantes de tus departamentos.")
-        page_historial_liquidaciones()
-        return
     # Usa la misma portada y paleta que la pantalla Inicio.
     page_section_header(
         "Liquidaciones",
@@ -4272,72 +5412,16 @@ def page_liquidaciones():
     if "liq_view" not in st.session_state:
         st.session_state.liq_view = "Historial"
     view = st.segmented_control(
-        "Vista de liquidaciones", ["Historial", "Preparar liquidación"],
+        "Vista de liquidaciones",
+        ["Historial", "Preparar liquidación", "Resumen mensual"],
         key="liq_view", label_visibility="collapsed"
     )
     if view == "Preparar liquidación":
         page_preparar_liquidacion()
+    elif view == "Resumen mensual":
+        page_resumen_mensual()
     else:
         page_historial_liquidaciones()
-
-
-
-# =========================================================
-# PROPIETARIOS / CUENTAS AUTORIZADAS
-# =========================================================
-
-def admin_owners():
-    conn = db()
-    try:
-        return [dict(fila) for fila in conn.execute("""
-            SELECT * FROM public.owners ORDER BY full_name
-        """).fetchall()]
-    finally:
-        conn.close()
-
-
-def page_propietarios():
-    page_section_header("Propietarios", "Registra propietarios y vincula sus departamentos.")
-    with st.expander("＋ Registrar propietario", expanded=False):
-        with st.form("form_nuevo_propietario", clear_on_submit=True):
-            rut_input = st.text_input("RUT del propietario")
-            nombre = st.text_input("Nombre completo")
-            telefono = st.text_input("Teléfono (opcional)")
-            email = st.text_input("Correo de contacto (opcional)")
-            submit = st.form_submit_button("Guardar propietario", type="primary")
-        if submit:
-            try:
-                rut = normalizar_rut(rut_input)
-                if not nombre.strip():
-                    raise ValueError("Ingresa el nombre del propietario.")
-                conn = db()
-                try:
-                    conn.execute("""
-                        INSERT INTO public.owners (rut, full_name, phone, email)
-                        VALUES (?, ?, ?, ?)
-                    """, (rut, nombre.strip(), telefono.strip(), email.strip().lower()))
-                    conn.commit()
-                finally:
-                    conn.close()
-                st.success("Propietario registrado. Puedes vincularlo desde Departamentos.")
-                st.rerun()
-            except psycopg2.errors.UniqueViolation:
-                st.error("Ese RUT ya está registrado.")
-            except Exception as error:
-                st.error(f"No se pudo registrar al propietario: {error}")
-
-    propietarios = admin_owners()
-    if not propietarios:
-        st.info("Todavía no hay propietarios registrados.")
-        return
-    departamentos = get_departments()
-    for propietario in propietarios:
-        with st.container(border=True):
-            st.markdown(f"**{html_escape(str(propietario['full_name']))}**")
-            st.caption(f"RUT: {html_escape(str(propietario['rut']))} · "
-                       f"Teléfono: {html_escape(str(propietario['phone'] or 'Sin teléfono'))}")
-            cantidad = sum(d.get('owner_id') == propietario['id'] for d in departamentos)
-            st.caption(f"Departamentos asociados: {cantidad}")
 
 
 # =========================================================
@@ -4356,14 +5440,17 @@ elif st.session_state.page == "Calendario":
 elif st.session_state.page == "Departamentos":
     page_departamentos()
 
+elif st.session_state.page == "Propietarios":
+    page_propietarios()
+
+elif st.session_state.page == "Reportes":
+    page_reportes()
+
 elif st.session_state.page == "Liquidaciones":
     page_liquidaciones()
 
 elif st.session_state.page == "Detalle":
     page_detalle()
-
-elif st.session_state.page == "Propietarios" and is_admin():
-    page_propietarios()
 
 else:
     st.session_state.page = "Inicio"
