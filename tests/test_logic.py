@@ -9,14 +9,22 @@ import unittest
 from datetime import date
 
 from logic import (
+    BANK_ACCOUNT_TYPES,
+    BANK_NAMES,
+    bank_copy_text,
+    bank_option_label,
     calculate_owner_liquidation,
+    canonical_bank_name,
+    detect_bank_account_type,
     format_clp,
+    mask_bank_account,
     money,
     nights_between,
     payment_status,
     payment_totals,
     pending_amount,
     season_price_for,
+    validate_bank_details,
     validate_date_range,
 )
 
@@ -157,6 +165,103 @@ class SeasonTests(unittest.TestCase):
     def test_inactive_season_is_ignored(self):
         seasons = [dict(self.SEASONS[0], active=False)]
         self.assertIsNone(season_price_for(seasons, "2026-01-15"))
+
+
+class BankDataTests(unittest.TestCase):
+    def test_known_banks_are_canonical(self):
+        self.assertEqual(canonical_bank_name("Banco de Chile"), "Banco de Chile")
+        self.assertEqual(canonical_bank_name("BancoEstado"), "BancoEstado")
+        self.assertEqual(canonical_bank_name("Coopeuch"), "Coopeuch")
+        self.assertEqual(canonical_bank_name("Mercado Pago"), "Mercado Pago")
+
+    def test_legacy_bank_names_are_recognized(self):
+        self.assertEqual(
+            canonical_bank_name("Santander cta/cte"), "Banco Santander"
+        )
+        self.assertEqual(
+            canonical_bank_name("Banco estado  cta/cte"), "BancoEstado"
+        )
+        self.assertEqual(
+            canonical_bank_name("De Chile / corriente"), "Banco de Chile"
+        )
+        self.assertEqual(
+            canonical_bank_name("Scotiabank corriente"), "Banco Scotiabank"
+        )
+        self.assertIsNone(canonical_bank_name("Banco inventado"))
+
+    def test_account_type_is_only_inferred_when_explicit(self):
+        self.assertEqual(
+            detect_bank_account_type("Santander cta/cte"), "Cuenta Corriente"
+        )
+        self.assertEqual(
+            detect_bank_account_type("BancoEstado cuenta RUT"), "Cuenta RUT"
+        )
+        self.assertEqual(
+            detect_bank_account_type("Banco de Chile"), ""
+        )
+
+    def test_account_number_is_masked(self):
+        self.assertEqual(mask_bank_account("123456789012"), "********9012")
+        self.assertEqual(mask_bank_account("1234"), "****")
+        self.assertEqual(mask_bank_account(""), "")
+
+    def test_bank_copy_text_keeps_full_account_and_labels(self):
+        text = bank_copy_text(
+            "Ana Pérez", "Banco de Chile", "Cuenta Corriente",
+            "123456789012", "Ana Pérez",
+        )
+        self.assertEqual(
+            text,
+            "Propietario: Ana Pérez\n"
+            "Banco: Banco de Chile\n"
+            "Tipo de cuenta: Cuenta Corriente\n"
+            "Número de cuenta: 123456789012\n"
+            "Titular: Ana Pérez",
+        )
+
+    def test_bank_copy_text_omits_empty_fields(self):
+        self.assertEqual(
+            bank_copy_text("Ana Pérez", "Efectivo"),
+            "Propietario: Ana Pérez\nBanco: Efectivo",
+        )
+
+    def test_bank_validation_allows_empty_or_complete(self):
+        self.assertIsNone(validate_bank_details("", "", ""))
+        self.assertIsNone(
+            validate_bank_details("BancoEstado", "Cuenta RUT", "12345678")
+        )
+        self.assertIsNone(validate_bank_details("Efectivo", "", ""))
+
+    def test_bank_validation_rejects_incomplete_data(self):
+        self.assertIn(
+            "Selecciona el banco",
+            validate_bank_details("", "Cuenta RUT", "12345678"),
+        )
+        self.assertIn(
+            "tipo de cuenta",
+            validate_bank_details("BancoEstado", "", "12345678"),
+        )
+        self.assertIn(
+            "número de cuenta",
+            validate_bank_details("BancoEstado", "Cuenta RUT", ""),
+        )
+        self.assertIn(
+            "al menos 4",
+            validate_bank_details("BancoEstado", "Cuenta RUT", "123"),
+        )
+        self.assertIn(
+            "lista",
+            validate_bank_details(
+                "Banco inventado", "Otra", "1234",
+                allowed_banks=BANK_NAMES,
+            ),
+        )
+
+    def test_bank_options_have_categories(self):
+        self.assertIn("🏦 Banco de Chile", bank_option_label("Banco de Chile"))
+        self.assertIn("cooperativas", bank_option_label("Coopeuch"))
+        self.assertIn("entidades financieras", bank_option_label("Tenpo"))
+        self.assertIn("Cuenta RUT", BANK_ACCOUNT_TYPES)
 
 
 if __name__ == "__main__":

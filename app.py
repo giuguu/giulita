@@ -19,11 +19,19 @@ from zoneinfo import ZoneInfo
 from contextlib import contextmanager
 
 from logic import (
+    BANK_ACCOUNT_TYPES,
+    BANK_NAMES,
+    bank_copy_text,
+    bank_option_label,
     calculate_owner_liquidation,
+    canonical_bank_name,
+    detect_bank_account_type,
     format_clp,
+    mask_bank_account,
     money,
     payment_status,
     season_price_for,
+    validate_bank_details,
 )
 
 # =========================================================
@@ -657,6 +665,7 @@ st.markdown(
         .calendar-day {{ min-height: 54px; padding: 6px 3px; }}
         .calendar-status {{ font-size: .6rem; }}
         .calendar-day-number {{ font-size: .8rem; }}
+        .owner-bank {{ grid-template-columns: 1fr; gap: 7px; }}
     }}
 
     .payment-status {{
@@ -1002,6 +1011,123 @@ st.markdown(
         margin-bottom: 10px;
     }}
 
+    .owner-bank {{
+        display: grid;
+        grid-template-columns: repeat(auto-fit, minmax(150px, 1fr));
+        gap: 8px 18px;
+        margin-top: 12px;
+        padding-top: 12px;
+        border-top: 1px solid {PINK_BORDER};
+    }}
+
+    .owner-bank-label {{
+        color: {MUTED};
+        font-size: .72rem;
+        font-weight: 700;
+        letter-spacing: .04em;
+        text-transform: uppercase;
+    }}
+
+    .owner-bank-value {{
+        color: {TEXT};
+        font-size: .9rem;
+        font-weight: 650;
+        overflow-wrap: anywhere;
+    }}
+
+    .owner-bank-empty {{
+        color: {MUTED};
+        font-size: .84rem;
+        margin-top: 10px;
+        padding-top: 10px;
+        border-top: 1px solid {PINK_BORDER};
+    }}
+
+    /* Botones de tipo de cuenta: selección visual en tonos rosados. */
+    [class*="st-key-owner_"][class*="account_type"] [data-testid="stButtonGroup"] button {{
+        border: 1px solid {PINK_BORDER} !important;
+        background: {PINK_LIGHT} !important;
+        color: {FUCHSIA_DARK} !important;
+        border-radius: 999px !important;
+        font-weight: 650 !important;
+        box-shadow: none !important;
+        transition: background .12s ease, border-color .12s ease, color .12s ease;
+    }}
+
+    [class*="st-key-owner_"][class*="account_type"] [data-testid="stButtonGroup"] button * {{
+        color: inherit !important;
+    }}
+
+    [class*="st-key-owner_"][class*="account_type"] [data-testid="stButtonGroup"] button:hover {{
+        border-color: {FUCHSIA} !important;
+        background: {PINK_BORDER} !important;
+        color: {FUCHSIA_DARK} !important;
+    }}
+
+    [class*="st-key-owner_"][class*="account_type"] [data-testid="stButtonGroup"] button[data-selected="true"],
+    [class*="st-key-owner_"][class*="account_type"] [data-testid="stButtonGroup"] button[aria-checked="true"],
+    [class*="st-key-owner_"][class*="account_type"] [data-testid="stButtonGroup"] button[aria-pressed="true"] {{
+        border-color: {FUCHSIA_DARK} !important;
+        background: {FUCHSIA} !important;
+        color: {WHITE} !important;
+        box-shadow: 0 4px 12px rgba(217,70,141,.24) !important;
+    }}
+
+    /* Selector de banco: bordes y foco en la misma paleta rosada. */
+    [class*="st-key-owner_"][class*="bank"] [data-baseweb="select"] > div {{
+        border-color: {PINK_BORDER} !important;
+        background: {WHITE} !important;
+    }}
+
+    [class*="st-key-owner_"][class*="bank"] [data-baseweb="select"] > div:focus-within {{
+        border-color: {FUCHSIA} !important;
+        box-shadow: 0 0 0 3px rgba(217,70,141,.14) !important;
+    }}
+
+    /* Botones de guardado de propietarios. */
+    [class*="st-key-owner_new_submit"] button,
+    [class*="st-key-owner_edit_submit"] button {{
+        background: linear-gradient(135deg, {FUCHSIA} 0%, {FUCHSIA_DARK} 100%) !important;
+        border: 1px solid {FUCHSIA_DARK} !important;
+        color: {WHITE} !important;
+        font-weight: 700 !important;
+    }}
+
+    [class*="st-key-owner_new_submit"] button:hover,
+    [class*="st-key-owner_edit_submit"] button:hover {{
+        background: {FUCHSIA_DARK} !important;
+        border-color: {FUCHSIA_DARK} !important;
+        color: {WHITE} !important;
+        box-shadow: 0 6px 16px rgba(217,70,141,.24) !important;
+    }}
+
+    [class*="st-key-owner_new_submit"] button *,
+    [class*="st-key-owner_edit_submit"] button * {{
+        color: {WHITE} !important;
+    }}
+
+    /* Botón para copiar los datos bancarios de cada propietario. */
+    [class*="st-key-owner_copy_"] button {{
+        border: 1px solid {PINK_BORDER} !important;
+        background: {PINK_SOFT} !important;
+        color: {FUCHSIA_DARK} !important;
+        border-radius: 999px !important;
+        font-weight: 650 !important;
+        padding: 4px 12px !important;
+        min-height: 34px !important;
+    }}
+
+    [class*="st-key-owner_copy_"] button:hover {{
+        border-color: {FUCHSIA} !important;
+        background: {PINK_LIGHT} !important;
+        color: {FUCHSIA_DARK} !important;
+        box-shadow: 0 4px 12px rgba(217,70,141,.14) !important;
+    }}
+
+    [class*="st-key-owner_copy_"] button * {{
+        color: inherit !important;
+    }}
+
     .report-table-wrap {{
         overflow-x: auto;
         border: 1px solid {PINK_BORDER};
@@ -1257,7 +1383,12 @@ def init_db():
                     SELECT 1 FROM information_schema.columns
                     WHERE table_schema='public' AND table_name='reservations'
                       AND column_name='deposit_due'
-                ) AS reservations_migrated
+                ) AS reservations_migrated,
+                EXISTS (
+                    SELECT 1 FROM information_schema.columns
+                    WHERE table_schema='public' AND table_name='owners'
+                      AND column_name='bank_account_type'
+                ) AS owners_bank_migrated
         """)
         row = cur.fetchone()
         missing = [
@@ -1276,6 +1407,12 @@ def init_db():
             st.error(
                 "La base no tiene la migración 001 aplicada. "
                 "Ejecuta migrations/001_improvements.sql antes de usar la app."
+            )
+            st.stop()
+        if not row["owners_bank_migrated"]:
+            st.error(
+                "La base no tiene la migración de datos bancarios de propietarios. "
+                "Ejecuta migrations/002_owner_bank_details.sql antes de usar la app."
             )
             st.stop()
     finally:
@@ -1440,8 +1577,8 @@ def get_owners(active_only=False):
 
 
 def save_owner(full_name, rut="", phone="", email="", bank_name="",
-               bank_account="", bank_holder="", commission_percent=10,
-               notes="", active=True, owner_id=None):
+               bank_account_type="", bank_account="", bank_holder="",
+               commission_percent=10, notes="", active=True, owner_id=None):
     conn = db()
     try:
         cur = conn.cursor()
@@ -1449,26 +1586,28 @@ def save_owner(full_name, rut="", phone="", email="", bank_name="",
             cur.execute("""
                 UPDATE owners
                 SET full_name=?, rut=?, phone=?, email=?, bank_name=?,
-                    bank_account=?, bank_holder=?, commission_percent=?,
-                    notes=?, active=?
+                    bank_account_type=?, bank_account=?, bank_holder=?,
+                    commission_percent=?, notes=?, active=?
                 WHERE id=?
             """, (
                 full_name.strip(), rut.strip(), phone.strip(), email.strip(),
-                bank_name.strip(), bank_account.strip(), bank_holder.strip(),
-                int(commission_percent), notes.strip(), bool(active), int(owner_id),
+                bank_name.strip(), bank_account_type.strip(), bank_account.strip(),
+                bank_holder.strip(), int(commission_percent), notes.strip(),
+                bool(active), int(owner_id),
             ))
             new_id = int(owner_id)
         else:
             new_id = cur.execute("""
                 INSERT INTO owners
-                    (full_name, rut, phone, email, bank_name, bank_account,
-                     bank_holder, commission_percent, notes, active)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    (full_name, rut, phone, email, bank_name, bank_account_type,
+                     bank_account, bank_holder, commission_percent, notes, active)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 RETURNING id
             """, (
                 full_name.strip(), rut.strip(), phone.strip(), email.strip(),
-                bank_name.strip(), bank_account.strip(), bank_holder.strip(),
-                int(commission_percent), notes.strip(), bool(active),
+                bank_name.strip(), bank_account_type.strip(), bank_account.strip(),
+                bank_holder.strip(), int(commission_percent), notes.strip(),
+                bool(active),
             )).fetchone()["id"]
         conn.commit()
         return new_id
@@ -2394,7 +2533,7 @@ def page_inicio():
                 <div class="hero-kicker">Gestión de arriendos temporales</div>
                 <h1 class="hero-title">Tu espacio,<br>tus reservas.</h1>
                 <div class="hero-text">Organiza tus departamentos, reservas, pagos y pendientes en un solo lugar.</div>
-                <div class="hero-date">📅 {fecha_espanol(today).capitalize()}</div>
+                <div class="hero-date">{fecha_espanol(today).capitalize()}</div>
             </div>
         </section>
         """
@@ -2405,7 +2544,7 @@ def page_inicio():
                 <div class="hero-kicker">Gestión de arriendos temporales</div>
                 <h1 class="hero-title">Tu espacio,<br>tus reservas.</h1>
                 <div class="hero-text">Organiza tus departamentos, reservas, pagos y pendientes en un solo lugar.</div>
-                <div class="hero-date">📅 {fecha_espanol(today).capitalize()}</div>
+                <div class="hero-date">{fecha_espanol(today).capitalize()}</div>
             </div>
         </section>
         """
@@ -2496,9 +2635,9 @@ def page_inicio():
                         <span class="reservation-tag">Próximo arriendo</span>
                         <div class="reservation-name">{esc(r['guest'])}</div>
                         <div class="reservation-info">
-                            🏢 {esc(r['dept_name'])} · {esc(r['condo'])}<br>
-                            📅 {fecha_corta_espanol(ci)} → {fecha_corta_espanol(co)} {co.year}<br>
-                            👥 {r['guests']} huéspedes · 🌙 {r['nights']} noches
+                            {esc(r['dept_name'])} · {esc(r['condo'])}<br>
+                            {fecha_corta_espanol(ci)} → {fecha_corta_espanol(co)} {co.year}<br>
+                            {r['guests']} huéspedes · {r['nights']} noches
                         </div>
                     </div>
                     """,
@@ -2513,7 +2652,7 @@ def page_inicio():
                     args=("Detalle", r["id"]),
                 )
 
-    st.markdown('<div class="section-title">🔔 Recordatorios</div>', unsafe_allow_html=True)
+    st.markdown('<div class="section-title">Recordatorios</div>', unsafe_allow_html=True)
 
     reminders = reminders_for(reservations, get_checklists_map())
 
@@ -2734,7 +2873,7 @@ def page_reservas():
             st.info("Cambiaste un dato de la reserva. Presiona nuevamente «Revisar reserva» para actualizar la revisión.")
 
         if st.button(
-            "👁️ Revisar reserva",
+            "Revisar reserva",
             type="primary",
             use_container_width=True,
             key="review_reservation"
@@ -2784,7 +2923,7 @@ def page_reservas():
                     <div class="detail-label">CONTACTO</div>
                     <div class="detail-value">{esc(reviewed["phone"] or "No registrado")}</div><br>
                     <div class="detail-label">DEPARTAMENTO</div>
-                    <div class="detail-value">🏢 {esc(reviewed["condo"])} · {esc(reviewed["dept_name"])}</div><br>
+                    <div class="detail-value">{esc(reviewed["condo"])} · {esc(reviewed["dept_name"])}</div><br>
                     <div class="detail-label">ESTADÍA</div>
                     <div class="detail-value">
                         {reviewed["check_in"].strftime("%d/%m/%Y")} · {reviewed["check_in_time"].strftime("%H:%M")}
@@ -2831,7 +2970,7 @@ def page_reservas():
 
             with save_col:
                 if st.button(
-                    "💾 Guardar reserva",
+                    "Guardar reserva",
                     type="primary",
                     use_container_width=True,
                     key="confirm_reservation"
@@ -2850,13 +2989,13 @@ def page_reservas():
 
                     if block:
                         st.error(
-                            "❌ No se puede guardar. El departamento está bloqueado por "
+                            "No se puede guardar. El departamento está bloqueado por "
                             f"mantención: {block['reason']} "
                             f"({block['start_date']:%d/%m/%Y} al {block['end_date']:%d/%m/%Y})."
                         )
                     elif conflict:
                         st.error(
-                            f"❌ No se puede guardar. El departamento ya está reservado "
+                            f"No se puede guardar. El departamento ya está reservado "
                             f"por {conflict['guest']} desde "
                             f"{date.fromisoformat(conflict['check_in']).strftime('%d/%m/%Y')} "
                             f"hasta {date.fromisoformat(conflict['check_out']).strftime('%d/%m/%Y')}."
@@ -2991,7 +3130,7 @@ def page_detalle():
     st.markdown(
         f"""<div class="reservation-heading">
             <span class="reservation-heading-guest">{esc(r['guest'])}</span>
-            <span class="reservation-heading-place">🏢 {esc(r['condo'])} · {esc(r['dept_name'])}</span>
+            <span class="reservation-heading-place">{esc(r['condo'])} · {esc(r['dept_name'])}</span>
             <span class="status-pill {status_css}">{esc(r['status'])}</span>
         </div>""",
         unsafe_allow_html=True
@@ -3049,7 +3188,7 @@ def page_detalle():
         args=("Liquidaciones", rid),
     )
 
-    st.markdown('<div class="section-title payment-section">💳 Pagos</div>', unsafe_allow_html=True)
+    st.markdown('<div class="section-title payment-section">Pagos</div>', unsafe_allow_html=True)
 
     st.markdown(
         f"""
@@ -3176,7 +3315,7 @@ def page_detalle():
                             st.success("Pago anulado y saldo recalculado.")
                             st.rerun()
 
-    st.markdown('<div class="section-title">🧹 Preparación del departamento</div>', unsafe_allow_html=True)
+    st.markdown('<div class="section-title">Preparación del departamento</div>', unsafe_allow_html=True)
 
     checklist = get_checklist(rid)
 
@@ -3217,7 +3356,7 @@ def page_detalle():
             st.success("Checklist actualizado.")
             st.rerun()
 
-    st.markdown('<div class="section-title">✏️ Editar reserva</div>', unsafe_allow_html=True)
+    st.markdown('<div class="section-title">Editar reserva</div>', unsafe_allow_html=True)
 
     departments = get_departments()
     dept_map = {
@@ -3399,7 +3538,7 @@ def page_detalle():
             "Si ya hay dinero registrado, usa la cancelación para no perder el historial."
         )
         if st.button(
-            "🗑️ Eliminar definitivamente",
+            "Eliminar definitivamente",
             key=f"delete_reservation_{rid}",
         ):
             st.session_state[f"confirm_delete_{rid}"] = True
@@ -3692,10 +3831,10 @@ def page_calendario():
                         st.markdown(
                             f"""
                             <div class="search-result-card">
-                                <div class="search-result-building">🏢 {esc(d['condo'])}</div>
+                                <div class="search-result-building">{esc(d['condo'])}</div>
                                 <div class="search-result-name">{esc(d['name'])}</div>
-                                <div>👥 Hasta {d['capacity']} huéspedes</div>
-                                <div>🌙 {nights_search} noche(s)</div>
+                                <div>Hasta {d['capacity']} huéspedes</div>
+                                <div>{nights_search} noche(s)</div>
                                 <div>🌤️ {money(night_price)} / noche</div>
                                 <div style="margin-top:7px;font-weight:800;color:{FUCHSIA_DARK}">
                                     Referencia: {money(total_reference)}
@@ -3856,7 +3995,7 @@ def page_departamentos():
                         <div class="building-content">
                             <div class="building-kicker">Edificio / condominio</div>
                             <div class="building-name">{esc(condo)}</div>
-                            <div class="building-count">🏠 {len(deps)} departamento(s)</div>
+                            <div class="building-count">{len(deps)} departamento(s)</div>
                         </div>
                     </div>
                     """,
@@ -3869,7 +4008,7 @@ def page_departamentos():
                         <div class="building-content">
                             <div class="building-kicker">Edificio / condominio</div>
                             <div class="building-name">{esc(condo)}</div>
-                            <div class="building-count">🏠 {len(deps)} departamento(s)</div>
+                            <div class="building-count">{len(deps)} departamento(s)</div>
                         </div>
                     </div>
                     """,
@@ -3925,7 +4064,7 @@ def page_departamentos():
                             <div class="dept-card">
                                 <div class="dept-name">{esc(d['name'])}</div>
                                 <div class="dept-condo">{esc(d['condo'])}</div>
-                                <div>👥 Hasta {d['capacity']} huéspedes</div>
+                                <div>Hasta {d['capacity']} huéspedes</div>
                                 <div>❄️ Invierno · {money(d['winter_price'])}</div>
                                 <div>☀️ Verano · {money(d['summer_price'])}</div>
                                 <div>👤 {esc(d['owner_display_name'] or 'Sin propietario')}</div>
@@ -4023,7 +4162,7 @@ def page_departamentos():
                                     st.rerun()
 
                             if st.button(
-                                "🗑️ Eliminar definitivamente",
+                                "Eliminar definitivamente",
                                 key=f"delete_d_{d['id']}",
                                 use_container_width=True,
                             ):
@@ -4201,10 +4340,83 @@ def page_departamentos():
 # PROPIETARIOS
 # =========================================================
 
+def _owner_bank_options(current=""):
+    """Opciones del selector, conservando un valor antiguo no reconocido."""
+    options = list(BANK_NAMES)
+    current = str(current or "").strip()
+    if current and current not in options:
+        options.append(current)
+    return options
+
+
+def _owner_bank_prefill(owner):
+    """Datos bancarios listos para el formulario de edición."""
+    raw_bank = str(owner.get("bank_name") or "").strip()
+    bank = canonical_bank_name(raw_bank) or raw_bank
+    account_type = str(owner.get("bank_account_type") or "").strip()
+    if not account_type:
+        # Compatibilidad con registros antiguos que tenían "cta/cte" dentro
+        # del nombre del banco.
+        account_type = detect_bank_account_type(raw_bank)
+    account = str(owner.get("bank_account") or "").strip()
+    return bank, account_type, account
+
+
+def _owner_bank_fields(prefix, bank="", account_type="", account="", holder="",
+                       editing=False):
+    """Renderiza los tres campos bancarios independientes."""
+    options = _owner_bank_options(bank)
+    selected_bank = st.selectbox(
+        "Banco",
+        options,
+        index=options.index(bank) if bank in options else None,
+        placeholder="Selecciona un banco o entidad",
+        format_func=bank_option_label,
+        key=f"{prefix}_bank",
+        help="Bancos, cooperativas y entidades financieras de Chile.",
+    )
+    selected_type = st.pills(
+        "Tipo de cuenta",
+        BANK_ACCOUNT_TYPES,
+        selection_mode="single",
+        default=account_type if account_type in BANK_ACCOUNT_TYPES else None,
+        key=f"{prefix}_account_type",
+        help="Selecciona una sola opción.",
+        width="stretch",
+    )
+    account_number = st.text_input(
+        "Número de cuenta",
+        value=account,
+        key=f"{prefix}_account",
+        help=(
+            "El número completo solo se muestra en este formulario de edición."
+            if editing else
+            "Obligatorio si registras banco y tipo de cuenta."
+        ),
+    )
+    account_holder = st.text_input(
+        "Titular de la cuenta",
+        value=holder,
+        key=f"{prefix}_holder",
+    )
+    return (
+        selected_bank or "",
+        selected_type or "",
+        account_number,
+        account_holder,
+    )
+
+
+def _bank_value(value):
+    """Guarda el nombre canónico cuando se reconoce; si no, conserva el actual."""
+    value = str(value or "").strip()
+    return canonical_bank_name(value) or value
+
+
 def page_propietarios():
     page_section_header(
         "Propietarios",
-        "Datos de contacto, banco y comisión de cada propietario.",
+        "Datos de contacto, datos bancarios y comisión de cada propietario.",
     )
 
     owners = get_owners()
@@ -4218,32 +4430,53 @@ def page_propietarios():
                 rut = st.text_input("RUT")
                 phone = st.text_input("Teléfono")
                 email = st.text_input("Email")
-            with c2:
-                bank_name = st.text_input("Banco")
-                bank_account = st.text_input("Cuenta")
-                bank_holder = st.text_input("Titular de la cuenta")
                 commission = st.number_input(
                     "Comisión (%)", min_value=0, max_value=100,
                     value=10, step=1,
                 )
+            with c2:
+                st.markdown("**Datos bancarios**")
+                st.caption(
+                    "Opcional. Si no registras datos bancarios, deja los "
+                    "campos vacíos."
+                )
+                bank_name, bank_type, bank_account, bank_holder = (
+                    _owner_bank_fields("owner_new", editing=False)
+                )
             notes = st.text_area("Notas")
             if st.form_submit_button(
                 "Guardar propietario", type="primary",
-                use_container_width=True,
+                use_container_width=True, key="owner_new_submit",
             ):
                 if not full_name.strip():
                     st.error("Ingresa el nombre del propietario.")
                 else:
-                    try:
-                        save_owner(
-                            full_name, rut, phone, email, bank_name,
-                            bank_account, bank_holder, commission, notes,
-                        )
-                    except Exception as exc:
-                        st.error(f"No se pudo guardar: {exc}")
+                    bank_error = validate_bank_details(
+                        bank_name, bank_type, bank_account,
+                        allowed_banks=_owner_bank_options(bank_name),
+                        holder=bank_holder,
+                    )
+                    if bank_error:
+                        st.error(bank_error)
                     else:
-                        st.success("Propietario guardado.")
-                        st.rerun()
+                        try:
+                            save_owner(
+                                full_name=full_name,
+                                rut=rut,
+                                phone=phone,
+                                email=email,
+                                bank_name=_bank_value(bank_name),
+                                bank_account_type=bank_type,
+                                bank_account=bank_account,
+                                bank_holder=bank_holder,
+                                commission_percent=commission,
+                                notes=notes,
+                            )
+                        except Exception as exc:
+                            st.error(f"No se pudo guardar: {exc}")
+                        else:
+                            st.success("Propietario guardado.")
+                            st.rerun()
 
     if not owners:
         st.info("Aún no hay propietarios registrados.")
@@ -4252,28 +4485,91 @@ def page_propietarios():
     for owner in owners:
         owned = [d for d in departments if d["owner_id"] == owner["id"]]
         active_label = "Activo" if owner["active"] else "Inactivo"
-        st.markdown(
-            f"""
-            <div class="owner-card">
-                <div style="display:flex;justify-content:space-between;gap:10px;flex-wrap:wrap">
-                    <div>
-                        <div style="font-size:1.08rem;font-weight:800">{esc(owner['full_name'])}</div>
-                        <div style="color:{MUTED};font-size:.86rem">
-                            {esc(owner['rut'] or 'Sin RUT')} · {esc(owner['phone'] or 'Sin teléfono')} · {esc(owner['email'] or 'Sin email')}
-                        </div>
-                    </div>
-                    <span class="status-pill {'ok' if owner['active'] else 'danger'}">{active_label}</span>
-                </div>
-                <div style="margin-top:8px;color:{MUTED};font-size:.88rem">
-                    Comisión: <b>{owner['commission_percent']}%</b> ·
-                    {len(owned)} departamento(s) asignado(s)
-                </div>
-            </div>
-            """,
-            unsafe_allow_html=True,
+        raw_bank = str(owner.get("bank_name") or "").strip()
+        display_bank = canonical_bank_name(raw_bank) or raw_bank
+        display_type = str(owner.get("bank_account_type") or "").strip()
+        if not display_type:
+            display_type = detect_bank_account_type(raw_bank)
+        display_account = str(owner.get("bank_account") or "").strip()
+        display_holder = str(owner.get("bank_holder") or "").strip()
+
+        if display_bank or display_type or display_account:
+            holder_html = ""
+            if display_holder:
+                holder_html = (
+                    "<div>"
+                    '<div class="owner-bank-label">Titular</div>'
+                    f'<div class="owner-bank-value">{esc(display_holder)}</div>'
+                    "</div>"
+                )
+            bank_html = (
+                '<div class="owner-bank">'
+                "<div>"
+                '<div class="owner-bank-label">Banco</div>'
+                f'<div class="owner-bank-value">{esc(display_bank or "Sin registrar")}</div>'
+                "</div>"
+                "<div>"
+                '<div class="owner-bank-label">Tipo de cuenta</div>'
+                f'<div class="owner-bank-value">{esc(display_type or "Sin registrar")}</div>'
+                "</div>"
+                "<div>"
+                '<div class="owner-bank-label">Número de cuenta</div>'
+                f'<div class="owner-bank-value">{esc(mask_bank_account(display_account) or "Sin registrar")}</div>'
+                "</div>"
+                f"{holder_html}"
+                "</div>"
+            )
+        else:
+            bank_html = (
+                '<div class="owner-bank-empty">'
+                "Sin datos bancarios registrados. Puedes agregarlos al editar."
+                "</div>"
+            )
+
+        card_html = (
+            '<div class="owner-card">'
+            '<div style="display:flex;justify-content:space-between;gap:10px;flex-wrap:wrap">'
+            "<div>"
+            f'<div style="font-size:1.08rem;font-weight:800">{esc(owner["full_name"])}</div>'
+            f'<div style="color:{MUTED};font-size:.86rem">'
+            f'{esc(owner["rut"] or "Sin RUT")} · {esc(owner["phone"] or "Sin teléfono")}'
+            f' · {esc(owner["email"] or "Sin email")}'
+            "</div>"
+            "</div>"
+            f'<span class="status-pill {"ok" if owner["active"] else "danger"}">{active_label}</span>'
+            "</div>"
+            f'<div style="margin-top:8px;color:{MUTED};font-size:.88rem">'
+            f"Comisión: <b>{owner['commission_percent']}%</b> · "
+            f"{len(owned)} departamento(s) asignado(s)"
+            "</div>"
+            f"{bank_html}"
+            "</div>"
         )
 
+        # st.html inserta el HTML directamente, sin que Markdown lo interprete
+        # como bloque de código (lo que mostraba las etiquetas como texto).
+        st.html(card_html)
+
+        if display_bank or display_type or display_account:
+            copy_text = bank_copy_text(
+                owner["full_name"],
+                display_bank,
+                display_type,
+                display_account,
+                display_holder,
+            )
+            with st.popover(
+                "📋 Copiar datos bancarios",
+                key=f"owner_copy_{owner['id']}",
+            ):
+                st.caption(
+                    "Usa el ícono de copiar del recuadro. El número "
+                    "completo solo se muestra al abrir este panel."
+                )
+                st.code(copy_text, language=None)
+
         with st.expander(f"Editar datos de {owner['full_name']}"):
+            bank, bank_type, bank_account = _owner_bank_prefill(owner)
             with st.form(f"owner_form_{owner['id']}"):
                 c1, c2 = st.columns(2)
                 with c1:
@@ -4283,35 +4579,60 @@ def page_propietarios():
                     e_rut = st.text_input("RUT", value=owner["rut"] or "")
                     e_phone = st.text_input("Teléfono", value=owner["phone"] or "")
                     e_email = st.text_input("Email", value=owner["email"] or "")
-                with c2:
-                    e_bank = st.text_input("Banco", value=owner["bank_name"] or "")
-                    e_account = st.text_input(
-                        "Cuenta", value=owner["bank_account"] or ""
-                    )
-                    e_holder = st.text_input(
-                        "Titular", value=owner["bank_holder"] or ""
-                    )
                     e_commission = st.number_input(
                         "Comisión (%)", min_value=0, max_value=100,
                         value=int(owner["commission_percent"]), step=1,
+                    )
+                with c2:
+                    st.markdown("**Datos bancarios**")
+                    st.caption(
+                        "El número de cuenta se muestra completo solo al editar."
+                    )
+                    e_bank, e_type, e_account, e_holder = _owner_bank_fields(
+                        f"owner_{owner['id']}",
+                        bank=bank,
+                        account_type=bank_type,
+                        account=bank_account,
+                        holder=owner["bank_holder"] or "",
+                        editing=True,
                     )
                 e_notes = st.text_area("Notas", value=owner["notes"] or "")
                 e_active = st.checkbox("Activo", value=bool(owner["active"]))
                 if st.form_submit_button(
                     "Guardar cambios", type="primary",
                     use_container_width=True,
+                    key=f"owner_edit_submit_{owner['id']}",
                 ):
-                    try:
-                        save_owner(
-                            e_full, e_rut, e_phone, e_email, e_bank,
-                            e_account, e_holder, e_commission, e_notes,
-                            e_active, owner_id=owner["id"],
-                        )
-                    except Exception as exc:
-                        st.error(f"No se pudo actualizar: {exc}")
+                    e_bank_error = validate_bank_details(
+                        e_bank, e_type, e_account,
+                        allowed_banks=_owner_bank_options(e_bank),
+                        holder=e_holder,
+                    )
+                    if not e_full.strip():
+                        st.error("Ingresa el nombre del propietario.")
+                    elif e_bank_error:
+                        st.error(e_bank_error)
                     else:
-                        st.success("Propietario actualizado.")
-                        st.rerun()
+                        try:
+                            save_owner(
+                                full_name=e_full,
+                                rut=e_rut,
+                                phone=e_phone,
+                                email=e_email,
+                                bank_name=_bank_value(e_bank),
+                                bank_account_type=e_type,
+                                bank_account=e_account,
+                                bank_holder=e_holder,
+                                commission_percent=e_commission,
+                                notes=e_notes,
+                                active=e_active,
+                                owner_id=owner["id"],
+                            )
+                        except Exception as exc:
+                            st.error(f"No se pudo actualizar: {exc}")
+                        else:
+                            st.success("Propietario actualizado.")
+                            st.rerun()
 
 
 # =========================================================

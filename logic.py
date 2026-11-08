@@ -6,6 +6,8 @@ conectarse a la base de datos.
 
 from __future__ import annotations
 
+import re
+import unicodedata
 from datetime import date, datetime
 
 
@@ -20,6 +22,206 @@ VALID_STATUSES = (
     STATUS_PAID,
     STATUS_CANCELLED,
 )
+
+# =========================================================
+# DATOS BANCARIOS DE PROPIETARIOS
+# =========================================================
+
+# La lista separa bancos, cooperativas y entidades financieras para no
+# presentar como banco a una entidad que no lo es. Banco del Desarrollo ya no
+# existe como banco independiente (fue absorbido por Scotiabank), por eso no se
+# incluye como opción duplicada.
+BANK_GROUPS = (
+    ("Bancos", (
+        "Banco de Chile",
+        "BancoEstado",
+        "Banco Santander",
+        "Banco BCI",
+        "Banco Itaú",
+        "Banco Scotiabank",
+        "Banco Falabella",
+        "Banco Ripley",
+        "Banco Security",
+        "Banco BICE",
+        "Banco Internacional",
+        "Banco Consorcio",
+        "Banco BTG Pactual Chile",
+    )),
+    ("Cooperativas", (
+        "Coopeuch",
+    )),
+    ("Entidades financieras", (
+        "Tenpo",
+        "Mercado Pago",
+    )),
+    ("Otros", (
+        "Efectivo",
+        "Otros",
+    )),
+)
+
+BANK_NAMES = tuple(name for _, names in BANK_GROUPS for name in names)
+BANK_CATEGORY = {
+    name: category for category, names in BANK_GROUPS for name in names
+}
+
+BANK_ACCOUNT_TYPES = (
+    "Cuenta Corriente",
+    "Cuenta Vista",
+    "Cuenta de Ahorro",
+    "Cuenta RUT",
+    "Cuenta Chequera Electrónica",
+    "Otra",
+)
+
+_BANK_ALIASES = (
+    (re.compile(r"santander"), "Banco Santander"),
+    (re.compile(r"banco\s*estado|(^|[^a-z])estado([^a-z]|$)"), "BancoEstado"),
+    (re.compile(r"bci|credito e inversiones"), "Banco BCI"),
+    (re.compile(r"falabella"), "Banco Falabella"),
+    (re.compile(r"scotiabank"), "Banco Scotiabank"),
+    (re.compile(r"itau"), "Banco Itaú"),
+    (re.compile(r"ripley"), "Banco Ripley"),
+    (re.compile(r"security"), "Banco Security"),
+    (re.compile(r"bice"), "Banco BICE"),
+    (re.compile(r"consorcio"), "Banco Consorcio"),
+    (re.compile(r"internacional"), "Banco Internacional"),
+    (re.compile(r"btg"), "Banco BTG Pactual Chile"),
+    (re.compile(r"coopeuch"), "Coopeuch"),
+    (re.compile(r"tenpo"), "Tenpo"),
+    (re.compile(r"mercado\s*pago"), "Mercado Pago"),
+    (re.compile(r"efectivo"), "Efectivo"),
+    (re.compile(r"(^|[^a-z])chile([^a-z]|$)"), "Banco de Chile"),
+)
+
+
+def _fold(value) -> str:
+    """Normaliza mayúsculas, tildes y separadores para comparar texto."""
+    text = unicodedata.normalize("NFKD", str(value or ""))
+    text = "".join(char for char in text if not unicodedata.combining(char))
+    return " ".join(text.casefold().replace("/", " ").split())
+
+
+def canonical_bank_name(value) -> str | None:
+    """Devuelve el nombre canónico del banco/entidad o ``None`` si no se conoce.
+
+    Se usa para reconocer los valores antiguos que mezclaban banco y tipo de
+    cuenta, por ejemplo ``"Santander cta/cte"``.
+    """
+    text = _fold(value)
+    if not text:
+        return None
+    for name in BANK_NAMES:
+        if _fold(name) == text:
+            return name
+    for pattern, name in _BANK_ALIASES:
+        if pattern.search(text):
+            return name
+    return None
+
+
+def detect_bank_account_type(value) -> str:
+    """Infiere el tipo de cuenta solo cuando el texto lo menciona con claridad."""
+    text = _fold(value)
+    if not text:
+        return ""
+    if (
+        re.search(r"\b(cta|cuenta)\s+(cte|corriente)\b", text)
+        or re.search(r"\bcorriente\b", text)
+    ):
+        return "Cuenta Corriente"
+    if (
+        re.search(r"\b(cta|cuenta)\s+vista\b", text)
+        or re.search(r"\bvista\b", text)
+    ):
+        return "Cuenta Vista"
+    if (
+        re.search(r"\b(cta|cuenta)\s+ahorro\b", text)
+        or re.search(r"\bahorro\b", text)
+    ):
+        return "Cuenta de Ahorro"
+    if re.search(r"\brut\b", text):
+        return "Cuenta RUT"
+    if re.search(r"chequera", text):
+        return "Cuenta Chequera Electrónica"
+    return ""
+
+
+def mask_bank_account(value) -> str:
+    """Enmascara el número de cuenta dejando visibles solo los últimos 4."""
+    text = str(value or "").strip()
+    if not text:
+        return ""
+    if len(text) <= 4:
+        return "****"
+    return "********" + text[-4:]
+
+
+def bank_copy_text(owner_name, bank="", account_type="", account="", holder=""):
+    """Texto listo para copiar con los datos bancarios de un propietario."""
+    lines = []
+    owner_name = str(owner_name or "").strip()
+    if owner_name:
+        lines.append(f"Propietario: {owner_name}")
+    for label, value in (
+        ("Banco", bank),
+        ("Tipo de cuenta", account_type),
+        ("Número de cuenta", account),
+        ("Titular", holder),
+    ):
+        value = str(value or "").strip()
+        if value:
+            lines.append(f"{label}: {value}")
+    return "\n".join(lines)
+
+
+def bank_option_label(name) -> str:
+    """Etiqueta agrupada para el selector de banco."""
+    if not name:
+        return "Selecciona un banco o entidad"
+    category = BANK_CATEGORY.get(name)
+    if category is None:
+        return f"• {name} (otro)"
+    icon = {
+        "Bancos": "🏦",
+        "Cooperativas": "🤝",
+        "Entidades financieras": "💳",
+        "Otros": "•",
+    }[category]
+    suffix = "" if category == "Bancos" else f" · {category.lower()}"
+    return f"{icon} {name}{suffix}"
+
+
+def validate_bank_details(
+    bank, account_type, account, allowed_banks=None, holder=""
+) -> str | None:
+    """Valida que los datos bancarios estén completos o totalmente vacíos.
+
+    Devuelve un mensaje de error o ``None`` si son válidos. ``Efectivo`` es una
+    forma de pago, no un banco: puede existir sin tipo ni número de cuenta.
+    """
+    bank = str(bank or "").strip()
+    account_type = str(account_type or "").strip()
+    account = str(account or "").strip()
+    holder = str(holder or "").strip()
+
+    if not any((bank, account_type, account, holder)):
+        return None
+    if not bank:
+        return "Selecciona el banco o entidad."
+    if allowed_banks is not None and bank not in allowed_banks:
+        return "Selecciona un banco o entidad de la lista."
+    if bank == "Efectivo" and not account_type and not account:
+        return None
+    if not account_type:
+        return "Selecciona el tipo de cuenta."
+    if account_type not in BANK_ACCOUNT_TYPES:
+        return "Selecciona un tipo de cuenta válido."
+    if not account:
+        return "Ingresa el número de cuenta."
+    if len(account) < 4:
+        return "El número de cuenta debe tener al menos 4 caracteres."
+    return None
 
 
 def money(value) -> str:
