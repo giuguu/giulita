@@ -11,6 +11,37 @@ import unicodedata
 from datetime import date, datetime
 
 
+# Contrato público del módulo. app.py importa estos nombres directamente; si
+# alguno desaparece, el test tests/test_app_logic_contract.py falla antes del
+# despliegue en lugar de romper Streamlit Cloud.
+__all__ = [
+    "STATUS_NO_DEPOSIT",
+    "STATUS_PARTIAL",
+    "STATUS_PAID",
+    "STATUS_CANCELLED",
+    "VALID_STATUSES",
+    "BANK_GROUPS",
+    "BANK_NAMES",
+    "BANK_CATEGORY",
+    "BANK_ACCOUNT_TYPES",
+    "canonical_bank_name",
+    "detect_bank_account_type",
+    "mask_bank_account",
+    "bank_copy_text",
+    "bank_option_label",
+    "validate_bank_details",
+    "money",
+    "format_clp",
+    "calculate_owner_liquidation",
+    "payment_status",
+    "pending_amount",
+    "payment_totals",
+    "nights_between",
+    "validate_date_range",
+    "season_price_for",
+]
+
+
 STATUS_NO_DEPOSIT = "Sin abono"
 STATUS_PARTIAL = "Abono recibido"
 STATUS_PAID = "Pagado completamente"
